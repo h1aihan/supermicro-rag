@@ -42,3 +42,4 @@ aws/
 
 # Jupyter
 .ipynb_checkpoints/
+embeddings/
