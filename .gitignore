@@ -11,7 +11,7 @@ ENV/
 
 # Data files
 data/
-# embeddings/   # uncomment to exclude; include for "just run" (can be large)
+embeddings/   # uncomment to exclude; include for "just run" (can be large)
 pdfs/
 *.pkl
 # *.faiss
