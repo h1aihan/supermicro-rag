@@ -1,8 +1,8 @@
 # Supermicro RAG Chatbot
 
-A Retrieval-Augmented Generation (RAG) chatbot that answers questions about Supermicro products, solutions, and documentation using the downloaded PDF collection.
+A Retrieval-Augmented Generation (RAG) chatbot that answers questions about Supermicro products, solutions, and documentation using 6000+ PDF documents.
 
-## 🚀 Quick Start
+## Quick Start (Local)
 
 ```bash
 # 1. Install dependencies
@@ -13,310 +13,201 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and add: OPENAI_API_KEY=sk-your-key-here
 
-# 3. Process PDFs and create index
+# 3. Process PDFs and create index (if not already done)
 python setup_rag.py
 
-# 4. Run chatbot
+# 4. Run chatbot (CLI)
 python src/chatbot.py --interactive
+
+# Or run web UI
+uvicorn src.server:app --host 0.0.0.0 --port 8000
 ```
 
-**That's it!** See [Quick Start Guide](#quick-start-guide) below for detailed instructions.
-
-## Overview
-
-This project implements a RAG-based question-answering system that:
-- Processes Supermicro PDF documents (manuals, datasheets, white papers, case studies, etc.)
-- Extracts and chunks text content for efficient retrieval
-- Embeds documents into a vector database using local models (FREE)
-- Answers user questions by retrieving relevant context and generating responses using an LLM
-
----
+Open `http://localhost:8000` for the web UI.
 
 ## Architecture
 
-### Implemented Architecture: Simple Local RAG
-
-**Tech Stack:**
-- **PDF Processing**: `pypdf` for text extraction
-- **Text Chunking**: `RecursiveCharacterTextSplitter` (via LangChain / `langchain-text-splitters`)
-- **Embeddings**: `sentence-transformers/all-MiniLM-L6-v2` - free, local
-- **Vector Store**: `FAISS` (Facebook AI Similarity Search) - disk-based
-- **LLM**: OpenAI GPT-5.2 (via API)
-
-**Key Features:**
-- ✅ No API costs for embeddings (local models)
-- ✅ Fast setup and processing
-- ✅ Privacy-friendly (embeddings and search are local)
-- ✅ Parallel PDF processing for speed
-- ✅ Resume capability (skips already processed files)
-
-**How It Works:**
-1. Extract text from all PDFs (parallelized)
-2. Split into chunks (1000 chars with 200 char overlap)
-3. Generate embeddings for each chunk (local sentence-transformers)
-4. Store in FAISS index
-5. Query: embed question → find top-k similar chunks → send to OpenAI LLM with context
-
----
-
-## Recommended Tech Stack (Starting Point)
-
-### Current Dependencies
-
-```python
-# Core dependencies (see requirements.txt)
-pypdf>=3.0.0                    # PDF text extraction
-langchain>=1.0.0                 # RAG orchestration
-langchain-text-splitters>=1.1.0  # Text splitting utilities
-sentence-transformers>=2.2.0     # Local embeddings (FREE)
-faiss-cpu>=1.7.4                # Vector search (or faiss-gpu if GPU available)
-openai>=2.15.0                   # LLM API (for GPT-5.2)
-python-dotenv>=1.0.0            # Environment variables
-tqdm>=4.65.0                     # Progress bars
-numpy>=1.24.0                    # Numerical operations
+```
+PDF Documents (6000+)
+       ↓
+   pypdf (extract text)
+       ↓
+   LangChain RecursiveCharacterTextSplitter (1000 chars, 200 overlap)
+       ↓
+   sentence-transformers/all-MiniLM-L6-v2 (embeddings, local/free)
+       ↓
+   FAISS vector index (~1.5GB)
+       ↓
+   Query → Retrieve top-K chunks → OpenAI GPT (answer generation)
 ```
 
----
+## AWS Deployment (EC2 + Docker)
+
+For production with a large FAISS index (~1.5GB), we use EC2 instead of App Runner to avoid health check timeouts during index loading.
+
+### Prerequisites
+- Docker installed locally
+- AWS CLI configured (`aws configure`)
+- `.env` file with `AWS_ACCOUNT_ID`, `AWS_REGION`, `REPO`, `APP_NAME`
+
+### 1) Push image to ECR
+
+```bash
+./scripts/aws_push_ecr.sh
+```
+
+### 2) Launch EC2 instance
+
+```bash
+# Load vars
+set -a; source .env; set +a
+
+# Create security group (SSH + HTTP)
+VPC_ID="$(aws ec2 describe-vpcs --region "$AWS_REGION" --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
+SG_ID="$(aws ec2 create-security-group --region "$AWS_REGION" --vpc-id "$VPC_ID" \
+  --group-name "${APP_NAME}-ec2-sg" --description "EC2 for ${APP_NAME}" --query GroupId --output text)"
+aws ec2 authorize-security-group-ingress --region "$AWS_REGION" --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --region "$AWS_REGION" --group-id "$SG_ID" --protocol tcp --port 8000 --cidr 0.0.0.0/0
+
+# Create IAM role for ECR access
+aws iam create-role --role-name "${APP_NAME}-ec2-role" --assume-role-policy-document '{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
+}'
+aws iam attach-role-policy --role-name "${APP_NAME}-ec2-role" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+aws iam create-instance-profile --instance-profile-name "${APP_NAME}-ec2-profile"
+aws iam add-role-to-instance-profile --instance-profile-name "${APP_NAME}-ec2-profile" --role-name "${APP_NAME}-ec2-role"
+
+# Create key pair
+aws ec2 create-key-pair --region "$AWS_REGION" --key-name "${APP_NAME}-key" --query 'KeyMaterial' --output text > ~/.ssh/${APP_NAME}-key.pem
+chmod 400 ~/.ssh/${APP_NAME}-key.pem
+
+# Launch instance (t3.medium, 4GB RAM)
+AMI_ID="$(aws ec2 describe-images --region "$AWS_REGION" --owners amazon \
+  --filters "Name=name,Values=al2023-ami-2023*-x86_64" "Name=state,Values=available" \
+  --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)"
+
+INSTANCE_ID="$(aws ec2 run-instances --region "$AWS_REGION" \
+  --image-id "$AMI_ID" \
+  --instance-type t3.medium \
+  --key-name "${APP_NAME}-key" \
+  --security-group-ids "$SG_ID" \
+  --iam-instance-profile Name="${APP_NAME}-ec2-profile" \
+  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${APP_NAME}}]" \
+  --query 'Instances[0].InstanceId' --output text)"
+
+# Wait and get IP
+aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$INSTANCE_ID"
+PUBLIC_IP="$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+echo "Public IP: $PUBLIC_IP"
+```
+
+### 3) Copy FAISS index to EC2
+
+```bash
+scp -i ~/.ssh/${APP_NAME}-key.pem -r embeddings/faiss_index ec2-user@${PUBLIC_IP}:~/faiss_index
+```
+
+### 4) SSH and run container
+
+```bash
+ssh -i ~/.ssh/${APP_NAME}-key.pem ec2-user@${PUBLIC_IP}
+
+# On EC2:
+sudo dnf install -y docker
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user
+newgrp docker
+
+# Login to ECR
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
+
+# Pull and run
+docker pull <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/supermicro-rag:latest
+
+docker run -d --name supermicro-rag \
+  -p 8000:8000 \
+  -v ~/faiss_index:/app/embeddings/faiss_index:ro \
+  -e OPENAI_API_KEY="sk-your-key" \
+  -e LLM_PROVIDER=openai \
+  -e LLM_MODEL=gpt-5.2 \
+  -e INDEX_DIR=/app/embeddings/faiss_index \
+  -e TOP_K=15 \
+  <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/supermicro-rag:latest
+
+# Auto-restart on reboot
+docker update --restart unless-stopped supermicro-rag
+```
+
+### 5) Access
+
+- **Web UI**: `http://<PUBLIC_IP>:8000`
+- **Health check**: `http://<PUBLIC_IP>:8000/health`
+- **API**: `POST http://<PUBLIC_IP>:8000/api/chat` with `{"message":"..."}`
 
 ## Project Structure
 
 ```
 supermicro-rag/
-├── pdfs/                    # PDF files (6000+)
-├── data/                    # Extracted text and chunks
-├── embeddings/faiss_index/  # FAISS vector index
-├── src/                     # Core modules (extract, chunk, embed, query, chatbot)
-├── config/                  # Configuration files
-├── setup_rag.py            # Complete setup script
-└── requirements.txt         # Dependencies
+├── src/
+│   ├── server.py       # FastAPI web server
+│   ├── chatbot.py      # RAG chatbot logic
+│   ├── index.py        # FAISS index wrapper
+│   ├── query.py        # Query processing
+│   ├── extract.py      # PDF text extraction
+│   ├── chunk.py        # Text chunking
+│   └── embed.py        # Embedding generation
+├── static/
+│   └── index.html      # Chat UI
+├── embeddings/
+│   └── faiss_index/    # FAISS index + metadata (~1.5GB)
+├── scripts/
+│   └── aws_push_ecr.sh # Push Docker image to ECR
+├── Dockerfile
+├── requirements.txt
+└── setup_rag.py        # One-command setup pipeline
 ```
-
----
-
-## Implementation Details
-
-- **Chunking**: 1000 characters with 200 character overlap using `RecursiveCharacterTextSplitter`
-- **Retrieval**: Top-k similarity search (default: 5 chunks) using FAISS
-- **Interface**: Command-line only (CLI)
-- **Performance**: Parallel PDF processing using multiprocessing
-
-## Quick Start Guide
-
-### Prerequisites
-
-- Python 3.10 or higher
-- PDF files in the `pdfs/` directory (already included: 6000+ PDFs)
-- OpenAI API key for GPT-5.2
-
-### Step 1: Install Dependencies
-
-```bash
-cd supermicro-rag
-python3 -m venv venv
-source venv/bin/activate          # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### Step 2: Configure API Keys (Required for OpenAI)
-
-**Option A: Use OpenAI (Recommended for best quality)**
-
-1. **Get your OpenAI API key:**
-   - Go to https://platform.openai.com/api-keys
-   - Sign in or create an account
-   - Click "Create new secret key"
-   - Copy the key (starts with `sk-`)
-
-2. **Create `.env` file:**
-   ```bash
-   cp .env.example .env
-   ```
-
-3. **Edit `.env` and add your API key:**
-   ```bash
-   OPENAI_API_KEY=sk-your-actual-api-key-here
-   LLM_PROVIDER=openai
-   LLM_MODEL=gpt-5.2
-   ```
-
-
-**⚠️ Important:** The `.env` file is already in `.gitignore` - never commit your API keys!
-
-### Step 3: Extract and Index PDFs
-
-**Recommended: Run the complete pipeline (fastest)**
-
-```bash
-python setup_rag.py
-```
-
-This will:
-1. Extract text from all PDFs (uses parallel processing - much faster!)
-2. Chunk the extracted text
-3. Generate embeddings and create FAISS index
-
-**Or run steps manually:**
-
-```bash
-# Step 1: Extract text from all PDFs (parallelized - uses all CPU cores by default)
-python src/extract.py --input pdfs/ --output data/raw_text/ --workers 8
-
-# Step 2: Chunk the text
-python src/chunk.py --input data/raw_text/ --output data/chunks.jsonl
-
-# Step 3: Generate embeddings and create FAISS index
-python src/embed.py --input data/chunks.jsonl --output embeddings/faiss_index/
-```
-
-**Note:** The first run processes all PDFs and may take 10-20 minutes. Subsequent runs skip already processed files.
-
-### Step 4: Run the Chatbot
-
-**Interactive mode (recommended):**
-```bash
-python src/chatbot.py --interactive
-```
-
-**Single query:**
-```bash
-python src/chatbot.py --query "What are the power requirements for X13 servers?"
-```
-
-**With custom settings:**
-```bash
-# Use specific model
-python src/chatbot.py --interactive --llm-model gpt-5.2
-
-# Retrieve more chunks for better context
-python src/chatbot.py --interactive --top-k 10
-```
-
----
-
-## Architecture Overview
-
-### What Uses APIs vs. Local Processing
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    RAG Pipeline                         │
-├─────────────────────────────────────────────────────────┤
-│                                                          │
-│  1. PDF Extraction    →  Local (pypdf) - FREE           │
-│  2. Text Chunking     →  Local (langchain) - FREE       │
-│  3. Embeddings        →  Local (sentence-transformers)  │
-│                        →  FREE, no API calls             │
-│  4. Vector Search     →  Local (FAISS) - FREE           │
-│  5. LLM Answer        →  OpenAI API (GPT-5.2)          │
-│                        →  Only this step uses API/key    │
-│                                                          │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Key Points:**
-- ✅ **Embeddings are FREE** - uses local `sentence-transformers` (no API costs)
-- ✅ **Vector search is FREE** - uses local FAISS index
-- ✅ **Only LLM uses API** - OpenAI GPT-5.2
-- ✅ **PDF processing is FREE** - all local processing
-
-### Current Implementation
-
-This project uses **Option 1: Simple Local RAG** with:
-- **PDF Processing**: `pypdf` (local, free)
-- **Text Chunking**: `RecursiveCharacterTextSplitter` from LangChain
-- **Embeddings**: `sentence-transformers/all-MiniLM-L6-v2` (local, free)
-- **Vector Store**: FAISS (local, free)
-- **LLM**: GPT-5.2 (OpenAI API)
-
----
-
-## Future Enhancements
-
-1. **Web Interface**: Gradio or Streamlit for browser-based interaction
-2. **Multi-modal RAG**: Extract images/diagrams from PDFs, use vision models
-3. **Table Extraction**: Better handling of datasheet tables
-4. **Citation Links**: Clickable links back to original PDF pages
-5. **Conversation Memory**: Remember previous questions in a session
-6. **Hybrid Search**: Combine semantic search with keyword search (BM25)
-7. **Evaluation**: Test accuracy with a question-answer dataset
-8. **Streaming Responses**: Stream LLM responses token-by-token
-
----
-
-## Resources
-
-- **LangChain RAG Tutorial**: https://python.langchain.com/docs/use_cases/question_answering/
-- **LlamaIndex**: https://www.llamaindex.ai/
-- **FAISS**: https://github.com/facebookresearch/faiss
-- **Sentence Transformers**: https://www.sbert.net/
-
----
 
 ## Configuration
 
-**Environment Variables** (`.env` file):
-- `OPENAI_API_KEY`: Your OpenAI API key (required)
-- `LLM_MODEL`: Model name (default: `gpt-5.2`)
+### Environment Variables
 
-**Key Command Options:**
-- `chatbot.py --interactive`: Interactive mode
-- `chatbot.py --query "question"`: Single query
-- `extract.py --workers 8`: Parallel processing (faster)
-- `chatbot.py --top-k 10`: Retrieve more chunks
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | (required) | OpenAI API key |
+| `LLM_PROVIDER` | `openai` | LLM provider |
+| `LLM_MODEL` | `gpt-5.2` | Model name |
+| `INDEX_DIR` | `embeddings/faiss_index/` | Path to FAISS index |
+| `TOP_K` | `5` | Number of chunks to retrieve (use 10-15 for broad questions) |
+| `FAISS_MMAP` | `1` | Memory-map FAISS index (reduces RAM usage) |
 
-See `USAGE.md` for complete command reference.
+## Tips for Best Results
 
----
+- **Ask specific questions** — "What GPU servers support NVIDIA HGX H100?" works better than "What are Supermicro's products?"
+- **Increase TOP_K** for broad questions (set `TOP_K=15` in env vars)
+- **Check sources** — the chatbot cites which PDFs it used
 
 ## Troubleshooting
 
-### "No module named 'src'"
-Run from the project root directory:
-```bash
-cd /home/h1aihan/supermicro-rag
-python src/chatbot.py --interactive
-```
-
-Or use module mode:
-```bash
-python -m src.chatbot --interactive
-```
-
 ### "FAISS index not found"
-Run the setup pipeline first:
-```bash
-python setup_rag.py
-```
+Run `python setup_rag.py` to create the index, or ensure `INDEX_DIR` points to the correct path.
 
-### "Missing OPENAI_API_KEY" or "Error calling OpenAI API"
-1. **Check `.env` file exists:**
-   ```bash
-   ls -la .env
-   ```
+### Slow first request
+The first request loads the 1.5GB FAISS index + downloads the embedding model. This can take 1-2 minutes. Subsequent requests are fast.
 
-2. **Verify API key is set:**
-   ```bash
-   cat .env | grep OPENAI_API_KEY
-   ```
+### Out of memory on EC2
+Use `t3.large` (8GB RAM) instead of `t3.medium` for large indexes.
 
-3. **Get a new API key:**
-   - Visit https://platform.openai.com/api-keys
-   - Create a new secret key
-   - Add it to `.env`: `OPENAI_API_KEY=sk-...`
+## Cost Estimate (AWS)
 
+| Resource | Cost |
+|----------|------|
+| t3.medium EC2 | ~$1/day |
+| 30GB EBS | ~$2.40/month |
+| ECR storage | ~$0.10/GB/month |
 
-### Extraction is slow
-Use parallel processing (default uses all CPU cores):
-```bash
-python src/extract.py --workers 8  # Adjust based on your CPU cores
-```
+## License
 
-
----
-
-## Additional Resources
-
-- **USAGE.md**: Detailed usage guide with all command options
-- **ENV_SETUP.md**: Complete guide to environment variables and API keys
-- **RAG_BEHAVIOR.md**: Explanation of how the RAG system uses knowledge
-- **QUICKSTART.md**: Quick reference for common tasks
+MIT

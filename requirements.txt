@@ -17,6 +17,10 @@ python-dotenv>=1.0.0
 # streamlit>=1.28.0
 # gradio>=4.0.0
 
+# Minimal HTTP API + lightweight UI
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
 # Optional: Local LLM
 # ollama>=0.1.0
 

@@ -5,6 +5,7 @@ This is a convenience module that wraps the FAISS index loading.
 """
 
 import json
+import os
 from pathlib import Path
 from typing import List, Dict, Tuple
 import numpy as np
@@ -38,8 +39,12 @@ class VectorIndex:
         index_file = self.index_dir / "faiss.index"
         if not index_file.exists():
             raise FileNotFoundError(f"FAISS index not found at {index_file}")
-        
-        self.index = faiss.read_index(str(index_file))
+
+        # On large indexes, mmap avoids reading the full index into RAM up-front.
+        # This is especially helpful when the index is stored on EFS.
+        use_mmap = (os.getenv("FAISS_MMAP", "1").strip() != "0")
+        io_flags = faiss.IO_FLAG_MMAP if use_mmap else 0
+        self.index = faiss.read_index(str(index_file), io_flags)
         print(f"Loaded FAISS index with {self.index.ntotal} vectors")
     
     def _load_metadata(self):

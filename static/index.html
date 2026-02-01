@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Supermicro RAG Chat</title>
+    <style>
+      :root {
+        /* Supermicro-inspired palette (heavier/darker UI) */
+        --sm-green: #009639;
+        --sm-red: #D22630;
+        --sm-blue: #003A70;
+
+        --bg: #06130d;
+        --panel: #0b1c14;
+        --muted: rgba(234, 240, 255, 0.72);
+        --text: #eaf0ff;
+        --accent: var(--sm-green);
+        --user: rgba(0, 150, 57, 0.12);
+        --bot: rgba(255, 255, 255, 0.06);
+        --border: rgba(255, 255, 255, 0.14);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        background:
+          radial-gradient(1100px 700px at 12% 0%, rgba(0,150,57,0.22), transparent 55%),
+          radial-gradient(900px 650px at 88% 0%, rgba(210,38,48,0.18), transparent 58%),
+          var(--bg);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 24px 16px 28px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+      .mark {
+        width: 30px;
+        height: 30px;
+        border-radius: 999px;
+        border: 3px solid var(--sm-green);
+        position: relative;
+        box-shadow:
+          0 0 0 6px rgba(0,150,57,0.10),
+          0 16px 40px rgba(0,0,0,0.35);
+      }
+      .mark::after {
+        content: "";
+        position: absolute;
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--sm-red);
+        right: -2px;
+        top: 3px;
+        box-shadow: 0 0 0 4px rgba(210,38,48,0.14);
+      }
+      .title {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      h1 {
+        font-size: 18px;
+        margin: 0;
+        letter-spacing: 0.2px;
+      }
+      .sub {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .pill {
+        font-size: 12px;
+        color: var(--muted);
+        padding: 6px 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: rgba(11, 28, 20, 0.75);
+        backdrop-filter: blur(8px);
+      }
+      .panel {
+        border: 1px solid var(--border);
+        background: rgba(11, 28, 20, 0.80);
+        border-radius: 14px;
+        overflow: hidden;
+        box-shadow: 0 22px 55px rgba(0, 0, 0, 0.40);
+        backdrop-filter: blur(10px);
+      }
+      .messages {
+        height: min(68vh, 640px);
+        overflow: auto;
+        padding: 14px;
+      }
+      .msg {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        margin: 10px 0;
+        line-height: 1.35;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      }
+      .msg.user { background: var(--user); border-color: rgba(0,150,57,0.35); }
+      .msg.bot { background: var(--bot); }
+      .msg.loading { opacity: 0.9; }
+      .dots::after {
+        content: "";
+        display: inline-block;
+        width: 18px;
+        text-align: left;
+        animation: dots 1.2s steps(4, end) infinite;
+      }
+      @keyframes dots {
+        0% { content: ""; }
+        25% { content: "."; }
+        50% { content: ".."; }
+        75% { content: "..."; }
+        100% { content: ""; }
+      }
+      .meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .sources {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .sources ul { margin: 6px 0 0; padding-left: 18px; }
+      .composer {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        padding: 12px;
+        border-top: 1px solid var(--border);
+        background: rgba(11, 28, 20, 0.86);
+      }
+      textarea {
+        width: 100%;
+        resize: none;
+        min-height: 44px;
+        max-height: 140px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background: rgba(6, 19, 13, 0.65);
+        color: var(--text);
+        outline: none;
+      }
+      textarea:focus {
+        border-color: rgba(0,150,57,0.70);
+        box-shadow: 0 0 0 4px rgba(0,150,57,0.18);
+      }
+      textarea:disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
+      }
+      button {
+        padding: 10px 14px;
+        border-radius: 12px;
+        border: 1px solid rgba(0,150,57,0.70);
+        background: linear-gradient(180deg, rgba(0,150,57,0.26), rgba(0,150,57,0.12));
+        color: var(--text);
+        cursor: pointer;
+        min-width: 92px;
+      }
+      button:hover {
+        border-color: rgba(0,150,57,0.85);
+        box-shadow: 0 12px 26px rgba(0,150,57,0.18);
+      }
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      .hint {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      a { color: #7db5ff; }
+
+      code { color: rgba(234, 240, 255, 0.92); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="brand">
+          <div class="mark" aria-hidden="true"></div>
+          <div class="title">
+            <h1>Supermicro RAG Chat</h1>
+            <div class="sub">Light UI • same-host API • POST <code>/api/chat</code></div>
+          </div>
+        </div>
+        <div class="pill" id="health">Checking health…</div>
+      </header>
+
+      <div class="panel">
+        <div class="messages" id="messages"></div>
+        <div class="composer">
+          <textarea id="input" placeholder="Ask a question about Supermicro products/docs… (Shift+Enter for newline)"></textarea>
+          <button id="send">Send</button>
+        </div>
+      </div>
+
+      <div class="hint">
+        Tip: this UI is intentionally minimal. If you want a separate frontend later (Vercel), set <code>CORS_ORIGINS</code> on the server.
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const messagesEl = $("messages");
+      const inputEl = $("input");
+      const sendBtn = $("send");
+      const healthEl = $("health");
+
+      function setPill(text) {
+        healthEl.textContent = text;
+      }
+
+      function addMessage(role, text, sources = null, { loading = false } = {}) {
+        const box = document.createElement("div");
+        box.className = "msg " + role + (loading ? " loading" : "");
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.innerHTML = `<span>${role === "user" ? "You" : "Assistant"}</span><span>${new Date().toLocaleTimeString()}</span>`;
+        const body = document.createElement("div");
+        if (loading) {
+          const span = document.createElement("span");
+          span.textContent = text || "Thinking";
+          const dots = document.createElement("span");
+          dots.className = "dots";
+          body.appendChild(span);
+          body.appendChild(dots);
+        } else {
+          body.textContent = text || "";
+        }
+        box.appendChild(meta);
+        box.appendChild(body);
+
+        if (sources && sources.length) {
+          const s = document.createElement("div");
+          s.className = "sources";
+          const ul = document.createElement("ul");
+          for (const src of sources) {
+            const li = document.createElement("li");
+            li.textContent = src;
+            ul.appendChild(li);
+          }
+          s.appendChild(document.createTextNode("Sources:"));
+          s.appendChild(ul);
+          box.appendChild(s);
+        }
+
+        messagesEl.appendChild(box);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return { box, body };
+      }
+
+      async function checkHealth() {
+        try {
+          const r = await fetch("/health");
+          const j = await r.json();
+          setPill(j.ok ? "Healthy" : "Unhealthy");
+        } catch (e) {
+          setPill("Offline");
+        }
+      }
+
+      async function send() {
+        const msg = inputEl.value.trim();
+        if (!msg) return;
+        inputEl.value = "";
+        addMessage("user", msg);
+
+        sendBtn.disabled = true;
+        sendBtn.textContent = "…";
+        inputEl.disabled = true;
+        const prevPill = healthEl.textContent;
+        setPill("Thinking…");
+        const pending = addMessage("bot", "Thinking", null, { loading: true });
+        try {
+          const r = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: msg }),
+          });
+          const j = await r.json();
+          // Replace the pending loading bubble with the final content
+          pending.box.classList.remove("loading");
+          pending.body.classList.remove("dots");
+          pending.body.textContent = j.answer || "(no answer)";
+
+          const sources = j.sources || [];
+          if (sources.length) {
+            const s = document.createElement("div");
+            s.className = "sources";
+            const ul = document.createElement("ul");
+            for (const src of sources) {
+              const li = document.createElement("li");
+              li.textContent = src;
+              ul.appendChild(li);
+            }
+            s.appendChild(document.createTextNode("Sources:"));
+            s.appendChild(ul);
+            pending.box.appendChild(s);
+          }
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } catch (e) {
+          pending.box.classList.remove("loading");
+          pending.body.textContent = "Request failed: " + (e?.message || String(e));
+        } finally {
+          sendBtn.disabled = false;
+          sendBtn.textContent = "Send";
+          inputEl.disabled = false;
+          inputEl.focus();
+          setPill(prevPill || "Healthy");
+        }
+      }
+
+      sendBtn.addEventListener("click", send);
+      inputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          send();
+        }
+      });
+
+      checkHealth();
+      addMessage("bot", "Hi! Ask me anything about Supermicro documentation indexed in this deployment.");
+      inputEl.focus();
+    </script>
+  </body>
+</html>
+

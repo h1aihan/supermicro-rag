@@ -1,0 +1,20 @@
+.env
+.venv
+venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.vscode/
+.idea/
+*.log
+
+# Large / not needed to run the hosted service
+pdfs/
+data/
+embeddings/
+project.zip
+project_embeddings.zip
+aws/
+
