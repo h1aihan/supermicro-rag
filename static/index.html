@@ -3,7 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Supermicro RAG Chat</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>Supermicro RAG Assistant</title>
     <style>
       :root {
         /* Supermicro-inspired palette (heavier/darker UI) */
@@ -192,14 +195,19 @@
         opacity: 0.55;
         cursor: not-allowed;
       }
-      .hint {
-        margin-top: 10px;
-        color: var(--muted);
-        font-size: 12px;
-      }
       a { color: #7db5ff; }
-
       code { color: rgba(234, 240, 255, 0.92); }
+      .new-chat {
+        padding: 6px 12px;
+        font-size: 12px;
+        min-width: auto;
+        background: transparent;
+        border-color: var(--border);
+      }
+      .new-chat:hover {
+        border-color: rgba(210,38,48,0.6);
+        background: rgba(210,38,48,0.1);
+      }
     </style>
   </head>
   <body>
@@ -208,11 +216,12 @@
         <div class="brand">
           <div class="mark" aria-hidden="true"></div>
           <div class="title">
-            <h1>Supermicro RAG Chat</h1>
-            <div class="sub">Light UI • same-host API • POST <code>/api/chat</code></div>
+            <h1>Supermicro RAG Assistant</h1>
+            <div class="sub">AI-powered product documentation search</div>
           </div>
         </div>
-        <div class="pill" id="health">Checking health…</div>
+        <div class="pill" id="health">Checking…</div>
+        <button class="new-chat" id="newChat">New Chat</button>
       </header>
 
       <div class="panel">
@@ -223,9 +232,6 @@
         </div>
       </div>
 
-      <div class="hint">
-        Tip: this UI is intentionally minimal. If you want a separate frontend later (Vercel), set <code>CORS_ORIGINS</code> on the server.
-      </div>
     </div>
 
     <script>
@@ -234,6 +240,9 @@
       const inputEl = $("input");
       const sendBtn = $("send");
       const healthEl = $("health");
+      
+      // Conversation history for context (sent to server for follow-up questions)
+      let conversationHistory = [];
 
       function setPill(text) {
         healthEl.textContent = text;
@@ -293,6 +302,12 @@
         if (!msg) return;
         inputEl.value = "";
         addMessage("user", msg);
+        
+        // Capture history BEFORE adding current message (last 6 turns for context)
+        const historyToSend = conversationHistory.slice(-6);
+        
+        // Add user message to history for future turns
+        conversationHistory.push({ role: "user", content: msg });
 
         sendBtn.disabled = true;
         sendBtn.textContent = "…";
@@ -304,13 +319,19 @@
           const r = await fetch("/api/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: msg }),
+            body: JSON.stringify({ 
+              message: msg,
+              history: historyToSend  // Send PREVIOUS messages only
+            }),
           });
           const j = await r.json();
           // Replace the pending loading bubble with the final content
           pending.box.classList.remove("loading");
           pending.body.classList.remove("dots");
           pending.body.textContent = j.answer || "(no answer)";
+          
+          // Add assistant response to history
+          conversationHistory.push({ role: "assistant", content: j.answer || "" });
 
           const sources = j.sources || [];
           if (sources.length) {
@@ -346,9 +367,16 @@
           send();
         }
       });
+      
+      $("newChat").addEventListener("click", () => {
+        conversationHistory = [];
+        messagesEl.innerHTML = "";
+        addMessage("bot", "Welcome! I can help you find information about Supermicro servers, storage systems, motherboards, and other products. Ask me about specifications, features, or compatibility.");
+        inputEl.focus();
+      });
 
       checkHealth();
-      addMessage("bot", "Hi! Ask me anything about Supermicro documentation indexed in this deployment.");
+      addMessage("bot", "Welcome! I can help you find information about Supermicro servers, storage systems, motherboards, and other products. Ask me about specifications, features, or compatibility.");
       inputEl.focus();
     </script>
   </body>

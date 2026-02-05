@@ -5,7 +5,14 @@ langchain-text-splitters>=1.1.0
 sentence-transformers>=2.2.0
 faiss-cpu>=1.7.4  # Use faiss-gpu if you have CUDA
 openai>=2.15.0
+anthropic>=0.40.0  # Claude API support
 python-dotenv>=1.0.0
+
+# Hybrid search (BM25 keyword search)
+rank_bm25>=0.2.2
+
+# Cross-encoder reranking (improves retrieval quality)
+# Uses same sentence-transformers library, no extra dependency needed
 
 # Optional: Enhanced PDF processing
 # pdfplumber>=0.10.0

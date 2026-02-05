@@ -88,8 +88,14 @@ if cors_origins:
     )
 
 
+class ChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
 class ChatRequest(BaseModel):
     message: str
+    history: Optional[List[ChatMessage]] = None  # Previous conversation turns
 
 
 @app.get("/health")
@@ -105,7 +111,26 @@ def ui():
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     bot = get_chatbot()
-    result = bot.answer(req.message)
+    
+    # Format conversation history if provided
+    conversation_context = ""
+    print(f"[DEBUG] Received history: {len(req.history) if req.history else 0} messages")
+    if req.history:
+        print(f"[DEBUG] History content: {[h.role + ': ' + h.content[:50] + '...' for h in req.history]}")
+        history_parts = []
+        for msg in req.history[-6:]:  # Keep last 6 messages (3 turns) for context
+            role = "User" if msg.role == "user" else "Assistant"
+            history_parts.append(f"{role}: {msg.content}")
+        if history_parts:
+            conversation_context = "\n".join(history_parts) + "\n\n"
+    
+    # Combine history with current message for context-aware retrieval
+    full_query = req.message
+    if conversation_context:
+        # Add conversation context to help with follow-up questions
+        full_query = f"{conversation_context}Current question: {req.message}"
+    
+    result = bot.answer(req.message, conversation_context=conversation_context)
     return {
         "answer": result.get("answer", ""),
         "sources": result.get("sources", []),

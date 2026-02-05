@@ -2,6 +2,19 @@
 
 A Retrieval-Augmented Generation (RAG) chatbot that answers questions about Supermicro products, solutions, and documentation using 6000+ PDF documents.
 
+## Live Demo
+
+**Currently hosted on AWS EC2**: The chatbot is deployed and running in the cloud. Contact for access to the live instance.
+
+## Features
+
+- **6000+ PDF documents** indexed from Supermicro's product documentation
+- **Semantic search** using FAISS vector index (~1.5GB)
+- **Local embeddings** with sentence-transformers (no API cost for search)
+- **OpenAI GPT** for answer generation with source citations
+- **Web UI** and REST API endpoints
+- **Docker-ready** for easy deployment
+
 ## Quick Start (Local)
 
 ```bash
@@ -41,9 +54,9 @@ PDF Documents (6000+)
    Query → Retrieve top-K chunks → OpenAI GPT (answer generation)
 ```
 
-## AWS Deployment (EC2 + Docker)
+## Cloud Deployment (AWS EC2 + Docker)
 
-For production with a large FAISS index (~1.5GB), we use EC2 instead of App Runner to avoid health check timeouts during index loading.
+**This is the current production setup.** We use EC2 instead of App Runner to handle the large FAISS index (~1.5GB) without health check timeouts during index loading.
 
 ### Prerequisites
 - Docker installed locally

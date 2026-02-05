@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Setup script to run the complete RAG pipeline.
+By default, only ingests datasheets for better retrieval quality.
 """
 
 import subprocess
 import sys
+import argparse
 from pathlib import Path
 
 
@@ -26,11 +28,25 @@ def run_command(cmd, description):
 
 def main():
     """Run the complete RAG setup pipeline."""
+    parser = argparse.ArgumentParser(description="Setup Supermicro RAG pipeline")
+    parser.add_argument(
+        "--filter",
+        choices=['datasheet', 'all'],
+        default='datasheet',
+        help="Filter PDFs: 'datasheet' (default, recommended) or 'all'"
+    )
+    args = parser.parse_args()
+    
     print("=" * 80)
     print("Supermicro RAG Setup")
     print("=" * 80)
+    print(f"\nDocument filter: {args.filter}")
+    if args.filter == 'datasheet':
+        print("  → Only datasheets will be ingested (recommended for better retrieval)")
+    else:
+        print("  → All PDFs will be ingested")
     print("\nThis script will:")
-    print("1. Extract text from PDFs")
+    print("1. Extract text from PDFs (filtered)")
     print("2. Chunk the extracted text")
     print("3. Generate embeddings and create FAISS index")
     print("\nThis may take a while depending on the number of PDFs...")
@@ -42,12 +58,17 @@ def main():
         print("Please copy PDFs to the pdfs/ directory first.")
         sys.exit(1)
     
-    # Step 1: Extract text from PDFs (with parallel processing)
+    # Step 1: Extract text from PDFs (with parallel processing and filtering)
     import multiprocessing
     num_workers = multiprocessing.cpu_count()
+    filter_desc = "datasheets only" if args.filter == 'datasheet' else "all PDFs"
     run_command(
-        [sys.executable, "src/extract.py", "--input", "pdfs/", "--output", "data/raw_text/", "--workers", str(num_workers)],
-        f"Step 1: Extracting text from PDFs (using {num_workers} parallel workers)"
+        [sys.executable, "src/extract.py", 
+         "--input", "pdfs/", 
+         "--output", "data/raw_text/", 
+         "--workers", str(num_workers),
+         "--filter", args.filter],
+        f"Step 1: Extracting text from PDFs ({filter_desc}, {num_workers} workers)"
     )
     
     # Step 2: Chunk the text
