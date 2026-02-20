@@ -13,8 +13,9 @@ __pycache__/
 # Large / not needed to run the hosted service
 pdfs/
 data/
-embeddings/
+# embeddings/ - INCLUDED for deployment (required for search)
 project.zip
+project_f.zip
 project_embeddings.zip
 aws/
 

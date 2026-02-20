@@ -169,6 +169,7 @@
         background: rgba(6, 19, 13, 0.65);
         color: var(--text);
         outline: none;
+        font-size: 16px; /* Prevents iOS Safari zoom on focus (needs >= 16px) */
       }
       textarea:focus {
         border-color: rgba(0,150,57,0.70);
@@ -197,6 +198,20 @@
       }
       a { color: #7db5ff; }
       code { color: rgba(234, 240, 255, 0.92); }
+      /* Markdown rendered content styles - override pre-wrap from .msg */
+      .msg .md-body { white-space: normal !important; }
+      .msg .md-body p { margin: 0.4em 0; }
+      .msg .md-body h2 { margin: 0.8em 0 0.3em; font-size: 1.1em; color: var(--text); font-weight: 600; }
+      .msg .md-body h3 { margin: 0.8em 0 0.3em; font-size: 1em; color: var(--text); font-weight: 600; }
+      .msg .md-body ul, .msg .md-body ol { margin: 0.3em 0; padding-left: 1.4em; }
+      .msg .md-body li { margin: 0.15em 0; }
+      .msg .md-body table { border-collapse: collapse; margin: 0.5em 0; width: 100%; font-size: 0.92em; }
+      .msg .md-body th, .msg .md-body td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+      .msg .md-body th { background: rgba(0,150,57,0.12); }
+      .msg .md-body strong { color: #fff; }
+      .msg .md-body code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-size: 0.9em; }
+      .msg .md-body pre { background: rgba(255,255,255,0.05); padding: 8px 12px; border-radius: 6px; overflow-x: auto; }
+      .msg .md-body hr { border: none; border-top: 1px solid var(--border); margin: 0.6em 0; }
       .new-chat {
         padding: 6px 12px;
         font-size: 12px;
@@ -234,8 +249,23 @@
 
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
     <script>
       const $ = (id) => document.getElementById(id);
+
+      // Configure marked for safe rendering
+      marked.setOptions({ breaks: true, gfm: true });
+
+      function renderMarkdown(text) {
+        try {
+          return marked.parse(text || "");
+        } catch (e) {
+          // Fallback to plain text if markdown parsing fails
+          const div = document.createElement("div");
+          div.textContent = text;
+          return div.innerHTML;
+        }
+      }
       const messagesEl = $("messages");
       const inputEl = $("input");
       const sendBtn = $("send");
@@ -262,6 +292,9 @@
           dots.className = "dots";
           body.appendChild(span);
           body.appendChild(dots);
+        } else if (role === "bot" && text) {
+          body.className = "md-body";
+          body.innerHTML = renderMarkdown(text);
         } else {
           body.textContent = text || "";
         }
@@ -325,10 +358,11 @@
             }),
           });
           const j = await r.json();
-          // Replace the pending loading bubble with the final content
+          // Replace the pending loading bubble with markdown-rendered content
           pending.box.classList.remove("loading");
           pending.body.classList.remove("dots");
-          pending.body.textContent = j.answer || "(no answer)";
+          pending.body.className = "md-body";
+          pending.body.innerHTML = renderMarkdown(j.answer || "(no answer)");
           
           // Add assistant response to history
           conversationHistory.push({ role: "assistant", content: j.answer || "" });

@@ -11,7 +11,7 @@ ENV/
 
 # Data files
 data/
-embeddings/   # uncomment to exclude; include for "just run" (can be large)
+embeddings/ 
 pdfs/
 *.pkl
 # *.faiss
@@ -42,4 +42,6 @@ aws/
 
 # Jupyter
 .ipynb_checkpoints/
-embeddings/
+
+# Test files
+*.txt

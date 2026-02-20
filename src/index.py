@@ -9,6 +9,7 @@ import re
 import pickle
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+from collections import defaultdict
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -77,6 +78,7 @@ class HybridIndex:
         self._load_faiss_index()
         self._load_bm25_index()
         self._load_metadata()
+        self._build_filename_index()
         self._load_model()
     
     def _load_faiss_index(self):
@@ -115,7 +117,17 @@ class HybridIndex:
                     self.metadata.append(json.loads(line))
         
         print(f"Loaded metadata for {len(self.metadata)} chunks")
-    
+
+    def _build_filename_index(self):
+        """Build an inverted index mapping filename tokens to chunk indices."""
+        self._filename_index: Dict[str, set] = defaultdict(set)
+        for idx, meta in enumerate(self.metadata):
+            source = meta.get('source_file', '').lower()
+            tokens = set(re.findall(r'\b\w{2,}\b', source.replace('_', ' ').replace('-', ' ')))
+            for token in tokens:
+                self._filename_index[token].add(idx)
+        print(f"Built filename index: {len(self._filename_index)} unique tokens across {len(self.metadata)} chunks")
+
     def _load_model(self):
         """Load sentence transformer model."""
         print(f"Loading embedding model: {self.model_name}...")
@@ -159,7 +171,41 @@ class HybridIndex:
             if scores[idx] > 0:  # Only include non-zero scores
                 results.append((int(idx), float(scores[idx])))
         return results
-    
+
+    def search_by_filename(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        """
+        Retrieve chunks whose source filename tokens match the query terms.
+
+        Returns:
+            List of (index, match_count) tuples, sorted by descending match count.
+        """
+        _STOPWORDS = {
+            'the', 'is', 'at', 'which', 'on', 'for', 'and', 'or', 'to', 'in',
+            'of', 'with', 'what', 'how', 'can', 'do', 'does', 'are', 'was',
+            'be', 'it', 'its', 'an', 'as', 'by', 'from', 'that', 'this',
+            'my', 'me', 'we', 'you', 'your', 'their', 'our', 'into', 'about',
+            'please', 'compare', 'suggest', 'recommend', 'show', 'tell',
+            'give', 'list', 'between', 'vs', 'versus', 'than', 'should',
+            'would', 'could', 'will', 'need', 'want', 'like', 'have', 'has',
+            'pdf', 'datasheet', 'spec', 'specs', 'specification', 'specifications',
+            'supermicro', 'server', 'servers', 'system', 'systems', 'series',
+            'rackmount', 'product', 'products', 'page', 'web', 'txt',
+        }
+        raw_tokens = re.findall(r'\b\w{2,}\b', query.lower().replace('-', ' ').replace('_', ' '))
+        terms = list(dict.fromkeys(
+            t for t in raw_tokens if len(t) >= 2 and t not in _STOPWORDS
+        ))
+        if not terms:
+            return []
+
+        chunk_scores: Dict[int, int] = defaultdict(int)
+        for term in terms:
+            for idx in self._filename_index.get(term, set()):
+                chunk_scores[idx] += 1
+
+        ranked = sorted(chunk_scores.items(), key=lambda x: x[1], reverse=True)
+        return [(idx, float(score)) for idx, score in ranked[:top_k]]
+
     def _is_product_code_query(self, query: str) -> bool:
         """
         Detect if query looks like a product code/identifier.
@@ -184,19 +230,83 @@ class HybridIndex:
                     return True
         return False
     
+    def _is_keyword_heavy_query(self, query: str) -> bool:
+        """
+        Detect queries that should heavily favor BM25 keyword search.
+        
+        Used for queries where exact term matching matters more than
+        semantic similarity (e.g., specific product names, short keyword queries).
+        """
+        words = query.strip().split()
+        
+        # Very short queries (1-2 words) are usually keyword lookups
+        if len(words) <= 2:
+            return True
+        
+        return False
+    
+    def _expand_query_for_bm25(self, query: str) -> str:
+        """
+        Expand query with stemmed variants for better BM25 matching.
+        
+        Uses general-purpose suffix rules so ANY query benefits 
+        (e.g., "servers"→"server", "skus"→"sku", "golden"→"gold").
+        No hardcoded term lists needed.
+        """
+        words = query.lower().split()
+        expansions = set()
+        
+        for word in words:
+            # Strip common English suffixes to create stem variants
+            # Plural → singular
+            if word.endswith('ies') and len(word) > 4:
+                expansions.add(word[:-3] + 'y')  # categories → category
+            elif word.endswith('ses') and len(word) > 4:
+                expansions.add(word[:-2])  # processes → process
+            elif word.endswith('es') and len(word) > 3:
+                expansions.add(word[:-2])  # switches → switch
+                expansions.add(word[:-1])  # also try just -s removed
+            elif word.endswith('s') and not word.endswith('ss') and len(word) > 3:
+                expansions.add(word[:-1])  # skus → sku, servers → server
+            
+            # -en suffix → base (golden → gold)  
+            if word.endswith('en') and len(word) > 4:
+                expansions.add(word[:-2])  # golden → gold
+            
+            # -ing suffix → base
+            if word.endswith('ing') and len(word) > 5:
+                expansions.add(word[:-3])  # computing → comput
+                expansions.add(word[:-3] + 'e')  # configuring → configure
+            
+            # -ed suffix → base  
+            if word.endswith('ed') and len(word) > 4:
+                expansions.add(word[:-2])  # configured → configur
+                expansions.add(word[:-1])  # also try just -d removed
+        
+        # Remove any expansions that are already in the query
+        new_terms = expansions - set(words)
+        # Remove very short stems (likely noise)
+        new_terms = {t for t in new_terms if len(t) > 2}
+        
+        if new_terms:
+            return query + ' ' + ' '.join(new_terms)
+        return query
+    
     def search_hybrid(
         self, 
         query: str, 
         top_k: int = 10,
         semantic_weight: float = None,  # None = auto-detect
         keyword_weight: float = None,   # None = auto-detect
-        rrf_k: int = 60
+        rrf_k: int = 60,
+        max_per_source: Optional[int] = None,
     ) -> List[Tuple[Dict, float]]:
         """
         Hybrid search combining semantic and keyword search using Reciprocal Rank Fusion.
         
         Uses adaptive weighting based on query type:
         - Product code queries (e.g., "521GE"): 80% BM25, 20% semantic
+        - Keyword-heavy queries (e.g., "gold series"): 75% BM25, 25% semantic
         - Natural language queries: 50% BM25, 50% semantic
         
         Args:
@@ -215,15 +325,22 @@ class HybridIndex:
                 # Product code queries: heavily favor BM25
                 semantic_weight = 0.2
                 keyword_weight = 0.8
+            elif self._is_keyword_heavy_query(query):
+                # Category/keyword queries: favor BM25 to match exact terms
+                semantic_weight = 0.25
+                keyword_weight = 0.75
             else:
                 # Natural language queries: balanced
                 semantic_weight = 0.5
                 keyword_weight = 0.5
         
-        # Get results from both methods (fetch more for fusion)
-        fetch_k = top_k * 3
+        # Get results from both methods (fetch more for better fusion coverage)
+        fetch_k = max(top_k * 5, 30)
         semantic_results = self.search_semantic(query, fetch_k)
-        keyword_results = self.search_keyword(query, fetch_k)
+        
+        # Expand query for BM25 (add synonyms/stemmed variants)
+        bm25_query = self._expand_query_for_bm25(query)
+        keyword_results = self.search_keyword(bm25_query, fetch_k)
         
         # Calculate RRF scores
         rrf_scores = {}
@@ -237,20 +354,106 @@ class HybridIndex:
         for rank, (idx, _) in enumerate(keyword_results):
             rrf_score = keyword_weight * (1.0 / (rrf_k + rank + 1))
             rrf_scores[idx] = rrf_scores.get(idx, 0) + rrf_score
+
+        # Third channel: filename matching (helps product family queries)
+        filename_results = self.search_by_filename(query, fetch_k)
+        if filename_results:
+            best_match_score = filename_results[0][1]
+            filename_weight = 1.0 if best_match_score >= 2 else 0.3
+            for rank, (idx, score) in enumerate(filename_results):
+                rrf_score = filename_weight * (1.0 / (rrf_k + rank + 1))
+                rrf_scores[idx] = rrf_scores.get(idx, 0) + rrf_score
+            if best_match_score >= 2:
+                top_fn = self.metadata[filename_results[0][0]].get('source_file', '?') if filename_results[0][0] < len(self.metadata) else '?'
+                print(f"[DEBUG] Filename channel: best={best_match_score} terms matched, weight={filename_weight}, top='{top_fn}'")
+
+        # Apply source-based boosting and boilerplate penalty
+        for idx in rrf_scores:
+            if idx < len(self.metadata):
+                meta = self.metadata[idx]
+                source_file = meta.get('source_file', '')
+                text = meta.get('text', '')
+                
+                # Penalize chunks that are mostly boilerplate footer text
+                # (the "As a global leader...broad range of SKUs" paragraph
+                #  appears in hundreds of Supermicro PDFs and pollutes keyword search)
+                text_flat = re.sub(r'\s+', ' ', text.lower())
+                if 'global leader in high performance' in text_flat and \
+                   'broad range of skus' in text_flat:
+                    rrf_scores[idx] *= 0.3  # Heavy penalty for boilerplate chunks
+                    continue
+                
+                # Source-based boosting
+                if source_file.endswith('.pdf'):
+                    rrf_scores[idx] *= 1.05  # Subtle PDF preference as tiebreaker
+                elif source_file.startswith('web_product_'):
+                    rrf_scores[idx] *= 1.02  # Minimal boost for structured product data
+                # web_page_* content: no boost (1.0x)
         
-        # Sort by combined RRF score
+        # Sort by combined RRF score (with source boost applied)
         sorted_indices = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-        
-        # Return top_k results (no per-source limit - for product datasheets we want
-        # multiple chunks from the same relevant document)
-        results = []
+
+        # ----- Source-diversity path (broad queries) -----
+        if max_per_source is not None:
+            source_counts: Dict[str, int] = defaultdict(int)
+            diversified = []
+            for idx, score in sorted_indices:
+                if idx < len(self.metadata):
+                    src = self.metadata[idx].get('source_file', '')
+                    norm_src = re.sub(r'__[0-9a-f]{8,}\.', '.', src)
+                    if source_counts[norm_src] < max_per_source:
+                        source_counts[norm_src] += 1
+                        diversified.append((self.metadata[idx], score))
+                        if len(diversified) >= top_k:
+                            break
+            return diversified
+
+        # ----- Concentrated path (detail / follow-up queries) -----
+        # Context expansion: if the top result comes from a multi-chunk document,
+        # pull in sibling chunks so the LLM gets complete context (e.g., all 
+        # product specs from a Global SKU page, not just the intro chunk).
+        initial_results = []
         for idx, score in sorted_indices[:top_k]:
             if idx < len(self.metadata):
-                results.append((self.metadata[idx], score))
+                initial_results.append((idx, self.metadata[idx], score))
         
-        return results
+        if initial_results:
+            top_source = initial_results[0][1].get('source_file', '')
+            top_total = initial_results[0][1].get('total_chunks', 1)
+            top_score = initial_results[0][2]
+            
+            # Only expand if top source has many chunks (multi-page document)
+            # and it scored significantly higher than #2
+            should_expand = (
+                top_total > 5 and 
+                (len(initial_results) < 2 or top_score > initial_results[1][2] * 1.03)
+            )
+            
+            if should_expand:
+                # Find all chunks from this source and add missing ones
+                existing_idxs = {r[0] for r in initial_results}
+                sibling_chunks = []
+                for i, m in enumerate(self.metadata):
+                    if m.get('source_file') == top_source and i not in existing_idxs:
+                        sibling_chunks.append((i, m, top_score * 0.95))
+                
+                # Sort siblings by chunk_index to maintain document order
+                sibling_chunks.sort(key=lambda x: x[1].get('chunk_index', 0))
+                
+                # Insert siblings (up to half of top_k to leave room for other sources)
+                max_siblings = top_k // 2
+                siblings_to_add = sibling_chunks[:max_siblings]
+                
+                # Build final result: top result + siblings + remaining results
+                final = [initial_results[0]]
+                final.extend(siblings_to_add)
+                remaining = [r for r in initial_results[1:] if r[0] not in {s[0] for s in siblings_to_add}]
+                final.extend(remaining)
+                initial_results = final[:top_k]
+        
+        return [(meta, score) for _, meta, score in initial_results]
     
-    def search(self, query: str, top_k: int = 5) -> List[Tuple[Dict, float]]:
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[Dict, float]]:
         """
         Default search method - uses hybrid search.
         
@@ -308,10 +511,14 @@ if __name__ == "__main__":
                 # Show tokenized query and detected type
                 query_tokens = tokenize_for_bm25(args.query)
                 is_product_code = index._is_product_code_query(args.query)
+                is_keyword_heavy = index._is_keyword_heavy_query(args.query)
                 print(f"\nQuery tokens: {query_tokens}")
                 print(f"Detected as product code: {is_product_code}")
+                print(f"Detected as keyword-heavy: {is_keyword_heavy}")
                 if is_product_code:
                     print(f"Using weights: 20% semantic, 80% BM25")
+                elif is_keyword_heavy:
+                    print(f"Using weights: 25% semantic, 75% BM25")
                 else:
                     print(f"Using weights: 50% semantic, 50% BM25")
                 

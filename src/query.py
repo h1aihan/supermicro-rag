@@ -27,29 +27,29 @@ PRODUCT_PREFIXES = ['SYS-', 'AS-', 'SBI-', 'AOC-', 'PWS-', 'BPN-', 'CSE-', 'SC',
 
 def preprocess_query(query: str) -> str:
     """
-    Preprocess query to improve retrieval for product codes.
+    Lightweight preprocessing: expand bare product codes with SYS-/AS- prefixes.
     
-    Examples:
-        "521GE" -> "521GE SYS-521GE"
-        "X13DEI" -> "X13DEI X13DEI-T"
+    The LLM query planner already handles product code normalization and
+    platform disambiguation (X-series = Intel, H-series = AMD), so this
+    function only adds prefix variants for bare codes like "521GE".
     """
-    # Check if query looks like a partial product code (alphanumeric, possibly with hyphen)
     words = query.split()
-    expanded_terms = []
-    
+    expanded_terms = list(words)
+
+    # --- Prefix expansion for bare product codes (e.g. "521GE" → SYS-521GE) ---
+    _SKIP_EXPAND = {'1u','2u','4u','8u','10u','h12','h13','h14','x12','x13','x14','b200','ddr4','ddr5'}
     for word in words:
-        expanded_terms.append(word)
-        
-        # If it looks like a product code fragment (e.g., "521GE", "X13DEI")
+        if word.lower() in _SKIP_EXPAND:
+            continue
+        has_digit = any(c.isdigit() for c in word)
+        if not has_digit:
+            continue
         if re.match(r'^[A-Z0-9][-A-Z0-9]*$', word, re.IGNORECASE):
-            # Check if it already has a prefix
             has_prefix = any(word.upper().startswith(p) for p in PRODUCT_PREFIXES)
-            
             if not has_prefix:
-                # Add common prefix variations
                 expanded_terms.append(f"SYS-{word}")
                 expanded_terms.append(f"AS-{word}")
-    
+
     return ' '.join(expanded_terms)
 
 
@@ -92,7 +92,6 @@ def _is_product_code_query(query: str) -> bool:
             has_digit = any(c.isdigit() for c in word)
             if has_letter and has_digit:
                 return True
-    return False
     return False
 
 
@@ -181,7 +180,8 @@ class RAGQueryProcessor:
     def retrieve(
         self, 
         query: str, 
-        top_k: int = 5
+        top_k: int = 10,
+        max_per_source: Optional[int] = None,
     ) -> List[Dict]:
         """
         Retrieve relevant chunks using hybrid search.
@@ -193,6 +193,7 @@ class RAGQueryProcessor:
         Args:
             query: User query
             top_k: Number of chunks to return
+            max_per_source: If set, cap chunks per source file for diversity
             
         Returns:
             List of chunk dictionaries with similarity scores
@@ -200,9 +201,8 @@ class RAGQueryProcessor:
         # Step 1: Preprocess query to expand product codes
         expanded_query = preprocess_query(query)
         
-        # Step 2: Hybrid search - no per-source limit, let the most relevant chunks win
-        # For product datasheets, we want multiple chunks from the same document
-        results = self.index.search_hybrid(expanded_query, top_k)
+        # Step 2: Hybrid search
+        results = self.index.search_hybrid(expanded_query, top_k, max_per_source=max_per_source)
         
         # Convert to list of dicts
         chunks = []

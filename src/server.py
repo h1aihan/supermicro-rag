@@ -48,7 +48,9 @@ def get_chatbot() -> SupermicroChatbot:
     embedding_model = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     llm_model = os.getenv("LLM_MODEL", "gpt-5.2")
     llm_provider = os.getenv("LLM_PROVIDER", "openai")
-    top_k = int(os.getenv("TOP_K", "5"))
+    top_k = int(os.getenv("TOP_K", "10"))
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0.5"))
+    top_p = float(os.getenv("LLM_TOP_P", "1.0"))
 
     _chatbot = SupermicroChatbot(
         index_dir=index_dir,
@@ -56,6 +58,8 @@ def get_chatbot() -> SupermicroChatbot:
         llm_model=llm_model,
         llm_provider=llm_provider,
         top_k=top_k,
+        temperature=temperature,
+        top_p=top_p,
     )
     return _chatbot
 
@@ -106,6 +110,71 @@ def health():
 @app.get("/")
 def ui():
     return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/api/document/{filename:path}")
+def get_document(filename: str):
+    """
+    Serve a PDF document by filename.
+    
+    Example: /api/document/datasheet_SYS-521GE-TNRT.pdf
+    """
+    # URL decode the filename
+    filename = urllib.parse.unquote(filename)
+    
+    # Security: prevent directory traversal
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    # Try to find the file (handle hash suffixes)
+    pdf_path = PDF_DIR / filename
+    
+    if not pdf_path.exists():
+        # Try to find a matching file with hash suffix
+        base_name = filename.replace(".pdf", "")
+        matching_files = list(PDF_DIR.glob(f"{base_name}*.pdf"))
+        if matching_files:
+            pdf_path = matching_files[0]
+        else:
+            # Also try without the hash suffix pattern
+            matching_files = list(PDF_DIR.glob(f"*{base_name}*.pdf"))
+            if matching_files:
+                pdf_path = matching_files[0]
+    
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail=f"Document not found: {filename}")
+    
+    return FileResponse(
+        str(pdf_path), 
+        media_type="application/pdf",
+        filename=pdf_path.name
+    )
+
+
+@app.get("/api/documents/search")
+def search_documents(q: str, limit: int = 10):
+    """
+    Search for documents by filename pattern.
+    
+    Example: /api/documents/search?q=521GE&limit=5
+    """
+    if not q or len(q) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
+    
+    # Find matching PDFs
+    matching_files = []
+    for pdf_file in PDF_DIR.glob("*.pdf"):
+        if q.lower() in pdf_file.name.lower():
+            # Remove hash suffixes for cleaner display
+            clean_name = pdf_file.name
+            matching_files.append({
+                "filename": pdf_file.name,
+                "url": f"/api/document/{urllib.parse.quote(pdf_file.name)}"
+            })
+            if len(matching_files) >= limit:
+                break
+    
+    return {"results": matching_files, "count": len(matching_files)}
 
 
 @app.post("/api/chat")

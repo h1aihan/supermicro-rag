@@ -17,28 +17,35 @@ except ImportError:  # langchain >= 0.3 splitters
     from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore
 
 
-def load_extracted_text(input_dir: str) -> List[Dict]:
+def load_extracted_text(input_dirs: List[str]) -> List[Dict]:
     """
-    Load all extracted text JSON files.
+    Load all extracted text JSON files from one or more directories.
     
     Args:
-        input_dir: Directory containing extracted text JSON files
+        input_dirs: List of directories containing extracted text JSON files
         
     Returns:
         List of extracted text dictionaries
     """
-    input_path = Path(input_dir)
-    json_files = list(input_path.glob("*.json"))
-    
     documents = []
-    for json_file in json_files:
-        try:
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if not data.get("error"):
-                    documents.append(data)
-        except Exception as e:
-            print(f"Error loading {json_file.name}: {e}")
+    
+    for input_dir in input_dirs:
+        input_path = Path(input_dir)
+        if not input_path.exists():
+            print(f"Warning: Directory '{input_dir}' does not exist, skipping")
+            continue
+            
+        json_files = list(input_path.glob("*.json"))
+        print(f"  Found {len(json_files)} JSON files in '{input_dir}'")
+        
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if not data.get("error"):
+                        documents.append(data)
+            except Exception as e:
+                print(f"Error loading {json_file.name}: {e}")
     
     return documents
 
@@ -92,18 +99,18 @@ def chunk_document(doc: Dict, chunk_size: int = 1000, chunk_overlap: int = 200) 
     return chunks
 
 
-def chunk_all_documents(input_dir: str, output_file: str, chunk_size: int = 1000, chunk_overlap: int = 200):
+def chunk_all_documents(input_dirs: List[str], output_file: str, chunk_size: int = 1000, chunk_overlap: int = 200):
     """
     Chunk all documents and save to JSONL file.
     
     Args:
-        input_dir: Directory containing extracted text JSON files
+        input_dirs: List of directories containing extracted text JSON files
         output_file: Output JSONL file path
         chunk_size: Size of each chunk in characters
         chunk_overlap: Overlap between chunks in characters
     """
-    print(f"Loading extracted text from '{input_dir}'...")
-    documents = load_extracted_text(input_dir)
+    print(f"Loading extracted text from {len(input_dirs)} directories...")
+    documents = load_extracted_text(input_dirs)
     
     if not documents:
         print("No documents found to chunk.")
@@ -136,8 +143,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--input",
-        default="data/raw_text/",
-        help="Input directory with extracted text JSON files (default: data/raw_text/)"
+        nargs='+',
+        default=["data/raw_text/"],
+        help="Input directories with extracted text JSON files (default: data/raw_text/)"
     )
     parser.add_argument(
         "--output",

@@ -6,6 +6,7 @@ Supports hybrid search (semantic + keyword).
 
 import json
 import pickle
+import re
 import argparse
 from pathlib import Path
 from typing import List, Dict
@@ -14,6 +15,62 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 from rank_bm25 import BM25Okapi
+
+
+_PLATFORM_ALIASES = {
+    'x12': 'H12', 'h12': 'X12',
+    'x13': 'H13', 'h13': 'X13',
+    'x14': 'H14', 'h14': 'X14',
+}
+
+_PREFIX_RE = re.compile(
+    r'^(datasheet|web_product|web_page|product[-_]brief|solution[-_]brief)[-_]',
+    re.IGNORECASE,
+)
+_HASH_RE = re.compile(r'__[a-f0-9]{8,}$')
+_EXT_RE = re.compile(r'\.(pdf|txt|json|jsonl)$', re.IGNORECASE)
+_PRODUCT_CODE_RE = re.compile(
+    r'\b(?:SYS|AS|SSG|SBI|AOC|MBD|PWS)-[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?',
+    re.IGNORECASE,
+)
+_PLATFORM_RE = re.compile(r'\b([XH]1[0-9])\b', re.IGNORECASE)
+
+
+def enrich_text(chunk: Dict) -> str:
+    """Prepend source-file metadata so FAISS/BM25 encode product identity."""
+    source = chunk.get('source_file', '')
+    text = chunk.get('text', '')
+    if not source:
+        return text
+
+    # Extract product codes from the raw filename (before normalising separators)
+    product_codes = [pc.upper() for pc in _PRODUCT_CODE_RE.findall(source)]
+
+    # Build a readable label from the filename
+    name = _EXT_RE.sub('', source)
+    name = _HASH_RE.sub('', name)
+    name = _PREFIX_RE.sub('', name)
+    label = re.sub(r'[_|]+', ' ', name).replace('-', ' ')
+    label = re.sub(r'\s+', ' ', label).strip()
+
+    # Detect platform generations and add cross-aliases
+    platforms = _PLATFORM_RE.findall(label)
+    platform_tags = []
+    for p in platforms:
+        pu = p.upper()
+        if pu not in platform_tags:
+            platform_tags.append(pu)
+        alias = _PLATFORM_ALIASES.get(p.lower())
+        if alias and alias not in platform_tags:
+            platform_tags.append(alias)
+
+    parts = [f'[Document: {label}]']
+    if platform_tags:
+        parts.append(f'[Platform: {" ".join(platform_tags)}]')
+    if product_codes:
+        parts.append(f'[Products: {", ".join(product_codes)}]')
+
+    return f'{" ".join(parts)}\n{text}'
 
 
 def tokenize_for_bm25(text: str) -> List[str]:
@@ -146,24 +203,21 @@ def create_bm25_index(chunks: List[Dict], output_dir: str):
     
     print("Building BM25 index for keyword search...")
     
-    # Tokenize all chunks (include source filename with boosted weight)
     tokenized_corpus = []
-    FILENAME_BOOST = 5  # Repeat filename tokens N times to boost their weight
     
     for chunk in tqdm(chunks, desc="Tokenizing for BM25"):
-        # Get source filename (e.g., "sys-521ge-tnrt.pdf")
-        source_file = chunk.get("source_file", "")
+        text = chunk.get("text", "")
+        source = chunk.get("source_file", "")
         
-        # Tokenize filename separately and repeat for boosting
-        filename_tokens = tokenize_for_bm25(source_file)
-        boosted_filename_tokens = filename_tokens * FILENAME_BOOST
+        text_tokens = tokenize_for_bm25(text)
         
-        # Tokenize the chunk text
-        text_tokens = tokenize_for_bm25(chunk["text"])
+        # Boost filename tokens so product identity terms from the source
+        # file name carry extra weight (e.g., "sys-521ge-tnrt" from filename)
+        if source:
+            source_tokens = tokenize_for_bm25(source.replace("_", " ").replace("|", " "))
+            text_tokens = source_tokens + text_tokens
         
-        # Combine: boosted filename tokens + text tokens
-        tokens = boosted_filename_tokens + text_tokens
-        tokenized_corpus.append(tokens)
+        tokenized_corpus.append(text_tokens)
     
     # Create BM25 index
     bm25 = BM25Okapi(tokenized_corpus)

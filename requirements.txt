@@ -37,3 +37,9 @@ numpy>=1.24.0
 tqdm>=4.65.0
 pyyaml>=6.0
 requests>=2.31.0
+# Web search for tool use
+duckduckgo-search>=6.0.0
+
+# Optional: tests (pip install pytest to run pytest tests/test_product_queries.py)
+# pytest>=7.0.0
+
