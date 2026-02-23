@@ -144,10 +144,11 @@ PUBLIC_IP="$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$
 echo "Public IP: $PUBLIC_IP"
 ```
 
-### 3) Copy FAISS index to EC2
+### 3) Copy FAISS index + pages data to EC2
 
 ```bash
 scp -i ~/.ssh/${APP_NAME}-key.pem -r embeddings/faiss_index ec2-user@${PUBLIC_IP}:~/faiss_index
+scp -i ~/.ssh/${APP_NAME}-key.pem -r data/pages ec2-user@${PUBLIC_IP}:~/pages
 ```
 
 ### 4) SSH and run container
@@ -171,10 +172,12 @@ docker pull <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/supermicro-rag:late
 docker run -d --name supermicro-rag \
   -p 8000:8000 \
   -v ~/faiss_index:/app/embeddings/faiss_index:ro \
+  -v ~/pages:/app/data/pages:ro \
   -e OPENAI_API_KEY="sk-your-key" \
   -e LLM_PROVIDER=openai \
   -e LLM_MODEL=gpt-5.2 \
   -e INDEX_DIR=/app/embeddings/faiss_index \
+  -e PRODUCTS_FILE=/app/data/pages/products.jsonl \
   -e TOP_K=15 \
   <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/supermicro-rag:latest
 
@@ -249,10 +252,11 @@ PUBLIC_IP="$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$
 echo "Public IP: $PUBLIC_IP"
 ```
 
-### 5) Copy FAISS index and run container
+### 5) Copy FAISS index + pages data and run container
 
 ```bash
 scp -i ~/.ssh/${APP}-key.pem -r embeddings/faiss_index ec2-user@${PUBLIC_IP}:~/faiss_index
+scp -i ~/.ssh/${APP}-key.pem -r data/pages ec2-user@${PUBLIC_IP}:~/pages
 
 ssh -i ~/.ssh/${APP}-key.pem ec2-user@${PUBLIC_IP}
 ```
@@ -270,10 +274,12 @@ sudo docker pull ACCOUNT.dkr.ecr.REGION.amazonaws.com/supermicro-rag:latest
 sudo docker run -d --name supermicro-rag-2 \
   -p 8000:8000 \
   -v ~/faiss_index:/app/embeddings/faiss_index:ro \
+  -v ~/pages:/app/data/pages:ro \
   -e ANTHROPIC_API_KEY="sk-ant-..." \
   -e LLM_PROVIDER=anthropic \
   -e ANTHROPIC_MODEL=claude-opus-4-5 \
   -e INDEX_DIR=/app/embeddings/faiss_index \
+  -e PRODUCTS_FILE=/app/data/pages/products.jsonl \
   -e TOP_K=15 \
   ACCOUNT.dkr.ecr.REGION.amazonaws.com/supermicro-rag:latest
 

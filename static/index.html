@@ -223,6 +223,17 @@
         border-color: rgba(210,38,48,0.6);
         background: rgba(210,38,48,0.1);
       }
+      @media (max-width: 600px) {
+        .wrap { padding: 12px 8px 16px; }
+        h1 { font-size: 15px; }
+        .sub { font-size: 11px; }
+        textarea { font-size: 14px; padding: 8px 10px; }
+        textarea::placeholder { font-size: 13px; }
+        button { min-width: 60px; padding: 8px 10px; font-size: 13px; }
+        .msg { padding: 8px 10px; font-size: 14px; }
+        .msg .md-body table { font-size: 0.82em; }
+        .composer { gap: 6px; padding: 8px; }
+      }
     </style>
   </head>
   <body>
@@ -242,7 +253,7 @@
       <div class="panel">
         <div class="messages" id="messages"></div>
         <div class="composer">
-          <textarea id="input" placeholder="Ask a question about Supermicro products/docs… (Shift+Enter for newline)"></textarea>
+          <textarea id="input" placeholder="Ask about Supermicro products…"></textarea>
           <button id="send">Send</button>
         </div>
       </div>

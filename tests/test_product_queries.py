@@ -1,20 +1,15 @@
 """
-Product-specific tests for the Supermicro RAG system.
+Unified test suite for the Supermicro RAG system.
 
-Exercises query planning (list / detail / compare / general) and product catalog
-integration. Use these to verify:
-  - Listing products (1U servers, GPU systems, Gold Series, etc.)
-  - Specific product specs (model numbers, form factor, CPU, memory, etc.)
-  - Comparisons (1U vs 2U, product lines)
-  - General docs (IPMI, DCSCM) without catalog
-  - Conversational: global/golden SKUs, how many GPUs, motherboards, switches
-  - Follow-up: true follow-ups (pronouns, continuations) and new-product-in-session
+Covers all query types: listing, detail, SKU-specific detail, recommendations,
+comparisons, general knowledge, conversational, misspell/partial, multi-product,
+and follow-up handling.
 
 Run to see results:
   python tests/test_product_queries.py              # run all, print answers
   python tests/test_product_queries.py --summary     # + one-line quality hint per query
   python tests/test_product_queries.py --dry-run     # print queries only
-  python tests/test_product_queries.py --category followup  # follow-up tests only
+  python tests/test_product_queries.py --category followup  # one category only
   pytest tests/test_product_queries.py -v            # run as pytest (assertions)
 
 Use --output FILE to write the same output to a file for later review.
@@ -42,7 +37,7 @@ if _dotenv.exists():
 
 
 # =============================================================================
-# Product test queries (list / detail / compare / general)
+# Product test queries (list / detail / compare / general / recommendation)
 # =============================================================================
 
 PRODUCT_TEST_QUERIES = [
@@ -76,6 +71,12 @@ PRODUCT_TEST_QUERIES = [
         "category": "list",
         "query": "List storage solutions",
         "expect": "SuperStorage or storage-focused products",
+    },
+    {
+        "id": "list_fattwin_dual_platform",
+        "category": "list",
+        "query": "Show me FatTwin servers available in both Intel and AMD variants",
+        "expect": "FatTwin products covering Intel and AMD CPU platforms",
     },
     # --- Conversational: global/golden SKUs, GPU counts, motherboards, switches ---
     {
@@ -169,6 +170,54 @@ PRODUCT_TEST_QUERIES = [
         "query": "What GPU servers support NVIDIA HGX H100?",
         "expect": "Systems supporting HGX H100",
     },
+    {
+        "id": "detail_ssg640_psu",
+        "category": "detail",
+        "query": "What power supply type ships standard with the SSG-640SP-E1CR60?",
+        "expect": "AC vs DC PSU info for this storage server model",
+    },
+    {
+        "id": "detail_621c_gpu_slots",
+        "category": "detail",
+        "query": "How many full-height full-length GPUs can the SYS-621C-TN12R accommodate?",
+        "expect": "FHFL GPU slot count or expansion capability for SYS-621C-TN12R",
+    },
+    {
+        "id": "detail_421ge_processors",
+        "category": "detail",
+        "query": "What processors are compatible with the SYS-421GE-NBRT-LCC?",
+        "expect": "CPU compatibility list for this GPU server model",
+    },
+    {
+        "id": "detail_521c_socket_count",
+        "category": "detail",
+        "query": "Does the SYS-521C-NR have one or two CPU sockets?",
+        "expect": "Single-socket (UP) vs dual-socket (DP) clarification",
+    },
+    {
+        "id": "detail_111c_gpu_width",
+        "category": "detail",
+        "query": "Will double-width GPU cards fit in the SYS-111C-NR?",
+        "expect": "Physical GPU card clearance or slot width info",
+    },
+    {
+        "id": "detail_111c_raid_support",
+        "category": "detail",
+        "query": "What RAID capabilities does the SYS-111C-NR offer?",
+        "expect": "Hardware or software RAID options for this 1U model",
+    },
+    {
+        "id": "detail_521c_expansion",
+        "category": "detail",
+        "query": "Describe the PCIe expansion slots available on SYS-521C-NR",
+        "expect": "PCIe lane layout, generations, and slot config",
+    },
+    {
+        "id": "detail_4125gs_variant_table",
+        "category": "detail",
+        "query": "Compare the AS-4125GS-TNRT, TNRT1, and TNRT2 variants side by side",
+        "expect": "Tabular or structured comparison of all three SKU variants",
+    },
     # --- Compare ---
     {
         "id": "compare_1u_2u",
@@ -181,6 +230,42 @@ PRODUCT_TEST_QUERIES = [
         "category": "compare",
         "query": "Difference between Gold Series and standard SKUs",
         "expect": "Pre-configured vs build-to-order or similar",
+    },
+    {
+        "id": "compare_hyper_h14_vs_h13",
+        "category": "compare",
+        "query": "How does the H14 Hyper series improve over H13 Hyper?",
+        "expect": "Generational upgrades in CPU, memory, I/O between H13 and H14 Hyper",
+    },
+    {
+        "id": "compare_flex_vs_big_twin",
+        "category": "compare",
+        "query": "FlexTwin vs BigTwin — what sets them apart?",
+        "expect": "Architectural and feature differences between these multi-node platforms",
+    },
+    {
+        "id": "compare_clouddc_generations",
+        "category": "compare",
+        "query": "What changed between the X13 and X14 CloudDC platforms?",
+        "expect": "Platform evolution from X13 to X14 in the CloudDC line",
+    },
+    {
+        "id": "compare_421ge_422ga",
+        "category": "compare",
+        "query": "Compare SYS-421GE-NBRT-LCC against SYS-422GA-NBRT-LCC",
+        "expect": "Spec or architecture differences between these two GPU server models",
+    },
+    {
+        "id": "compare_grandtwin_gens",
+        "category": "compare",
+        "query": "X13 GrandTwin vs X14 GrandTwin — key differences?",
+        "expect": "Generational comparison for the GrandTwin multi-node platform",
+    },
+    {
+        "id": "compare_wio_e_series",
+        "category": "compare",
+        "query": "Break down the differences between SYS-511E-WR, SYS-111E-WR, and SYS-521E-WR",
+        "expect": "Three-way comparison covering form factor, expansion, and use cases",
     },
     # --- Misspelled / partial / fuzzy product names ---
     {
@@ -256,7 +341,7 @@ PRODUCT_TEST_QUERIES = [
         "query": "Do you have servers that support both GPUs and high storage capacity?",
         "expect": "Systems with GPU support AND significant storage (e.g., GPU servers with many drive bays)",
     },
-    # --- General (no catalog) ---
+    # --- General knowledge ---
     {
         "id": "general_ipmi",
         "category": "general",
@@ -268,6 +353,91 @@ PRODUCT_TEST_QUERIES = [
         "category": "general",
         "query": "What is DCSCM?",
         "expect": "Definition/explanation from docs",
+    },
+    {
+        "id": "general_gb200_platform",
+        "category": "general",
+        "query": "Tell me about the GB200 NVL72 platform",
+        "expect": "Supermicro GB200 NVL72 GPU rack-scale architecture info",
+    },
+    {
+        "id": "general_grandtwin_benefits",
+        "category": "general",
+        "query": "Why would I choose a GrandTwin over other multi-node systems?",
+        "expect": "Advantages of GrandTwin architecture vs alternatives",
+    },
+    {
+        "id": "general_h100_air_cooling",
+        "category": "general",
+        "query": "What air-cooled options exist for H100 GPUs?",
+        "expect": "Supermicro systems with air-cooled NVIDIA H100 support",
+    },
+    {
+        "id": "general_b200_specs",
+        "category": "general",
+        "query": "What are the specifications of the B200 air-cooled GPU server?",
+        "expect": "Hardware specs for air-cooled B200 GPU system",
+    },
+    {
+        "id": "general_openbmc_support",
+        "category": "general",
+        "query": "What Supermicro products offer OpenBMC support?",
+        "expect": "Server models or platforms with OpenBMC management",
+    },
+    {
+        "id": "general_x14_wio_lineup",
+        "category": "general",
+        "query": "List the X14 single-processor WIO server lineup",
+        "expect": "X14-generation UP WIO models or product family overview",
+    },
+    {
+        "id": "general_gold_gpu_skus",
+        "category": "general",
+        "query": "Are there Gold Series SKUs for GPU servers?",
+        "expect": "Gold Series pre-configured GPU server offerings",
+    },
+    # --- Recommendation: user asks for a system suggestion ---
+    {
+        "id": "rec_smb_file_server",
+        "category": "recommendation",
+        "query": "What server would you recommend for a small business file sharing setup?",
+        "expect": "Storage-friendly system suitable for SMB NAS or file server use",
+    },
+    {
+        "id": "rec_8gpu_h200",
+        "category": "recommendation",
+        "query": "I need a system that can fit 8 H200 GPUs, what are my options?",
+        "expect": "8-GPU HGX or large-form-factor server with H200 support",
+    },
+    {
+        "id": "rec_dense_multinode",
+        "category": "recommendation",
+        "query": "Suggest a high-density multi-node compute platform",
+        "expect": "Dense multi-node product (Twin, FatTwin, MicroCloud, etc.)",
+    },
+    {
+        "id": "rec_111e_vs_112b",
+        "category": "recommendation",
+        "query": "Help me decide between SYS-111E-WR and SYS-112B-WR for my workload",
+        "expect": "Side-by-side analysis with a recommendation based on trade-offs",
+    },
+    {
+        "id": "rec_xeon6_system",
+        "category": "recommendation",
+        "query": "What systems support the latest Intel Xeon 6 processors?",
+        "expect": "Granite Rapids or Sierra Forest server options",
+    },
+    {
+        "id": "rec_x14_hyper_single",
+        "category": "recommendation",
+        "query": "Suggest an X14 Hyper single-socket server",
+        "expect": "X14-gen UP Hyper model recommendation",
+    },
+    {
+        "id": "rec_rtx6000_pro",
+        "category": "recommendation",
+        "query": "Which servers are compatible with NVIDIA RTX 6000 Pro GPUs?",
+        "expect": "Workstation or GPU server models supporting RTX 6000 Pro",
     },
 ]
 
@@ -334,7 +504,7 @@ FOLLOWUP_TEST_QUERIES = [
         "query": "721ge?",
         "expect": "Info about 721GE (NOT 521GE); should treat as new query, not follow-up. If no datasheet, say so — do NOT hallucinate specs.",
         "should_followup": False,
-        "bad_if_contains": ["521GE-TNRT"],  # should not reference the old product
+        "bad_if_contains": ["521GE-TNRT"],
     },
     {
         "id": "new_product_821ge_after_521ge",
@@ -458,7 +628,7 @@ def _quality_hint(out: dict, item: dict) -> str:
         hints.append("API_ERROR")
     elif "No relevant information" in ans and n_src == 0:
         hints.append("NO_CONTEXT")
-    elif item["category"] in ("list", "detail", "conversational") and n_src == 0:
+    elif item["category"] in ("list", "detail", "conversational", "recommendation") and n_src == 0:
         hints.append("NO_SOURCES")
     elif n_char < 100 and "don't have" in ans.lower():
         hints.append("MISSING_DATA")
@@ -474,7 +644,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Run product queries and print results")
     parser.add_argument("--dry-run", action="store_true", help="Only print queries, do not call chatbot")
-    parser.add_argument("--category", choices=["list", "detail", "compare", "general", "conversational", "followup", "misspell", "multi"], help="Run only this category")
+    parser.add_argument("--category", choices=["list", "detail", "compare", "general", "conversational", "recommendation", "followup", "misspell", "multi"], help="Run only this category")
     parser.add_argument("--id", dest="query_id", help="Run only the test with this id (e.g. list_1u)")
     parser.add_argument("--summary", action="store_true", help="Print a one-line quality hint after each answer and a summary at the end")
     parser.add_argument("--output", "-o", dest="output_file", metavar="FILE", help="Write test output to FILE (same as terminal)")
@@ -621,20 +791,18 @@ def test_product_query_returns_answer(product_query):
     result = chatbot.answer(product_query["query"], conversation_context=conversation)
     answer = result.get("answer", "")
     assert answer, f"Empty answer for: {product_query['query']}"
-    # Avoid API/config error messages being treated as success
     assert "OPENAI_API_KEY" not in answer and "Error calling" not in answer, (
         f"Looks like an API/config error: {answer[:200]}"
     )
 
 
 def test_product_query_list_has_sources(product_query):
-    """Listing and detail queries should typically have at least one source (catalog or RAG)."""
-    if product_query["category"] not in ("list", "detail", "conversational"):
+    """Listing, detail, and recommendation queries should typically have at least one source."""
+    if product_query["category"] not in ("list", "detail", "conversational", "recommendation"):
         return  # skip for compare/general/followup
     chatbot = get_chatbot()
     result = chatbot.answer(product_query["query"])
     sources = result.get("sources", [])
-    # Allow 0 sources only if catalog is empty and RAG found nothing
     assert isinstance(sources, list), "sources should be a list"
 
 
