@@ -57,6 +57,10 @@ class QueryPlan:
     use_catalog: bool = False
     use_rag: bool = True
 
+    # Whether the query needs cross-document graph expansion
+    # (e.g., accessories, parts, compatible components, motherboard details)
+    accessory_query: bool = False
+
     def __repr__(self):
         parts = [f"intent={self.intent}"]
         if self.product_codes:
@@ -71,6 +75,8 @@ class QueryPlan:
             parts.append(f"kw={self.keywords}")
         parts.append(f"catalog={'Y' if self.use_catalog else 'N'}")
         parts.append(f"rag={'Y' if self.use_rag else 'N'}")
+        if self.accessory_query:
+            parts.append("graph_expand=Y")
         return f"QueryPlan({', '.join(parts)})"
 
 
@@ -146,8 +152,13 @@ AMD CPU generation to Supermicro platform mapping:
   "keywords": [],
   "search_queries": ["query1", "query2"],
   "use_catalog": true/false,
-  "use_rag": true/false
+  "use_rag": true/false,
+  "accessory_query": true/false
 }
+
+## accessory_query FIELD
+Set accessory_query=true when the user asks about parts, accessories, or components that may live in a DIFFERENT document than the main product datasheet. This triggers cross-document graph lookup to find related information across documents (e.g., chassis pages, parts lists, compatibility tables).
+Set accessory_query=false when the question can be answered from the product's own datasheet or catalog entry.
 
 ## search_queries FIELD
 This is a LIST of search queries. Use MULTIPLE queries when the user asks about DISTINCT topics so each gets its own retrieval:
@@ -207,6 +218,16 @@ KEY DISTINCTION: "what are [product line]?" → list (products).  "what is [conc
 - "What is IPMI?" → general (IPMI is a technical concept)
 - "H14" or "X14" or "H13 servers" → list (these are product platform generations with multiple product families to enumerate, use_catalog=true). Generate MULTIPLE search queries covering different product families within the platform so retrieval hits actual datasheets rather than one broad query that only matches product briefs.
 
+## SPEC-BASED PRODUCT DISCOVERY
+When the user specifies multiple hardware constraints (form factor, CPU family, processor count, drive bays, etc.) WITHOUT a specific model number, this is a product discovery query. The catalog has structured fields and is the best tool for this.
+
+Rules for spec-based discovery:
+- intent=list, use_catalog=true, use_rag=true
+- Do NOT guess a product family tag (Hyper, Mainstream, etc.) — leave tags=[] so the catalog searches across ALL families
+- Put each hardware constraint as a separate keyword in the keywords array
+- Set form_factor if the user specified one
+- Generate ONE search query that concatenates the key specs naturally
+
 ## GUIDELINES
 - For "list" intent: use_catalog=true, use_rag=true (catalog for product data, RAG for supplementary context)
 - For "detail" intent: use_catalog=true (if asking about a specific model), use_rag=true
@@ -230,6 +251,8 @@ KEY DISTINCTION: "what are [product line]?" → list (products).  "what is [conc
 # =============================================================================
 
 _planner_usage = defaultdict(int)
+_planner_anthropic_client = None
+_planner_openai_client = None
 
 
 def get_planner_usage() -> dict:
@@ -269,12 +292,15 @@ def _call_planner_llm(query: str, conversation_context: Optional[str] = None) ->
 
     if provider == "anthropic":
         try:
+            global _planner_anthropic_client
             from anthropic import Anthropic
             api_key = os.getenv("ANTHROPIC_API_KEY")
             if not api_key:
                 return None
 
-            client = Anthropic(api_key=api_key)
+            if _planner_anthropic_client is None:
+                _planner_anthropic_client = Anthropic(api_key=api_key)
+            client = _planner_anthropic_client
             planner_model = os.getenv("PLANNER_MODEL", "claude-haiku-4-5")
 
             response = client.messages.create(
@@ -301,12 +327,15 @@ def _call_planner_llm(query: str, conversation_context: Optional[str] = None) ->
 
     elif provider == "openai":
         try:
+            global _planner_openai_client
             from openai import OpenAI
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 return None
 
-            client = OpenAI(api_key=api_key)
+            if _planner_openai_client is None:
+                _planner_openai_client = OpenAI(api_key=api_key)
+            client = _planner_openai_client
             planner_model = os.getenv("PLANNER_MODEL", "gpt-4o-mini")
 
             response = client.chat.completions.create(
@@ -413,6 +442,9 @@ def _parse_plan(raw: str, original_query: str) -> QueryPlan:
     # Catalog / RAG flags
     plan.use_catalog = bool(data.get("use_catalog", False))
     plan.use_rag = bool(data.get("use_rag", True))
+
+    # Accessory / graph-expansion flag
+    plan.accessory_query = bool(data.get("accessory_query", False))
     
     # Safety: ensure at least one retrieval path
     if not plan.use_catalog and not plan.use_rag:

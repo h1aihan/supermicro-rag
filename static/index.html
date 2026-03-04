@@ -346,11 +346,8 @@
         if (!msg) return;
         inputEl.value = "";
         addMessage("user", msg);
-        
-        // Capture history BEFORE adding current message (last 6 turns for context)
+
         const historyToSend = conversationHistory.slice(-6);
-        
-        // Add user message to history for future turns
         conversationHistory.push({ role: "user", content: msg });
 
         sendBtn.disabled = true;
@@ -359,40 +356,71 @@
         const prevPill = healthEl.textContent;
         setPill("Thinking…");
         const pending = addMessage("bot", "Thinking", null, { loading: true });
+
+        let fullAnswer = "";
         try {
-          const r = await fetch("/api/chat", {
+          const r = await fetch("/api/chat/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              message: msg,
-              history: historyToSend  // Send PREVIOUS messages only
-            }),
+            body: JSON.stringify({ message: msg, history: historyToSend }),
           });
-          const j = await r.json();
-          // Replace the pending loading bubble with markdown-rendered content
-          pending.box.classList.remove("loading");
-          pending.body.classList.remove("dots");
-          pending.body.className = "md-body";
-          pending.body.innerHTML = renderMarkdown(j.answer || "(no answer)");
-          
-          // Add assistant response to history
-          conversationHistory.push({ role: "assistant", content: j.answer || "" });
 
-          const sources = j.sources || [];
-          if (sources.length) {
-            const s = document.createElement("div");
-            s.className = "sources";
-            const ul = document.createElement("ul");
-            for (const src of sources) {
-              const li = document.createElement("li");
-              li.textContent = src;
-              ul.appendChild(li);
+          const reader = r.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          let streamStarted = false;
+          let sources = [];
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+
+            let boundary;
+            while ((boundary = buf.indexOf("\n\n")) !== -1) {
+              const raw = buf.slice(0, boundary);
+              buf = buf.slice(boundary + 2);
+
+              let event = "message", data = "";
+              for (const line of raw.split("\n")) {
+                if (line.startsWith("event: ")) event = line.slice(7);
+                else if (line.startsWith("data: ")) data = line.slice(6);
+              }
+              data = data.replace(/\\n/g, "\n");
+
+              if (event === "sources") {
+                try { sources = JSON.parse(data); } catch {}
+              } else if (event === "token") {
+                if (!streamStarted) {
+                  streamStarted = true;
+                  pending.box.classList.remove("loading");
+                  pending.body.className = "md-body";
+                  pending.body.innerHTML = "";
+                  setPill("Streaming…");
+                }
+                fullAnswer += data;
+                pending.body.innerHTML = renderMarkdown(fullAnswer);
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+              } else if (event === "done") {
+                if (sources.length) {
+                  const s = document.createElement("div");
+                  s.className = "sources";
+                  const ul = document.createElement("ul");
+                  for (const src of sources) {
+                    const li = document.createElement("li");
+                    li.textContent = src;
+                    ul.appendChild(li);
+                  }
+                  s.appendChild(document.createTextNode("Sources:"));
+                  s.appendChild(ul);
+                  pending.box.appendChild(s);
+                }
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+              }
             }
-            s.appendChild(document.createTextNode("Sources:"));
-            s.appendChild(ul);
-            pending.box.appendChild(s);
           }
-          messagesEl.scrollTop = messagesEl.scrollHeight;
+
+          conversationHistory.push({ role: "assistant", content: fullAnswer });
         } catch (e) {
           pending.box.classList.remove("loading");
           pending.body.textContent = "Request failed: " + (e?.message || String(e));

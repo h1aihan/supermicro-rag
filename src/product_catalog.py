@@ -115,15 +115,50 @@ class ProductCatalog:
             tags.add("GPU-capable")
         
         product["tags"] = tags
-        
+
+        # --- Parsed spec fields for structured filtering ---
+        cpu_field = product.get("cpu", "")
+        storage_field = product.get("storage", "")
+
+        cpu_count = 0
+        m = re.search(r'(?:Max\s+Number\s+of\s+CPU|Processor(?:s)?)\s*(\d)', cpu_field, re.IGNORECASE)
+        if m:
+            cpu_count = int(m.group(1))
+        elif "dual" in cpu_field.lower() or "two" in cpu_field.lower():
+            cpu_count = 2
+        elif "single" in cpu_field.lower() or "one" in cpu_field.lower():
+            cpu_count = 1
+        product["cpu_count"] = cpu_count
+
+        all_text_lower = f"{name} {cpu_field} {product.get('category', '')}".lower()
+        cpu_family = ""
+        if "epyc" in all_text_lower:
+            cpu_family = "EPYC"
+        elif "xeon" in all_text_lower:
+            cpu_family = "Xeon"
+        product["cpu_family"] = cpu_family
+
+        drive_bay_count = 0
+        drive_size = ""
+        m = re.search(r'(\d+)\s+(?:\d[\d./\"\']*\s*)?(?:Hot-Swap|hot-swap|Internal)', storage_field)
+        if m:
+            drive_bay_count = int(m.group(1))
+        if '3.5' in storage_field:
+            drive_size = "3.5"
+        elif '2.5' in storage_field:
+            drive_size = "2.5"
+        product["drive_bay_count"] = drive_bay_count
+        product["drive_size"] = drive_size
+
         # Build searchable text blob (all fields concatenated)
         search_parts = [
             name, model, product.get("category", ""),
             product.get("key_features", ""),
-            product.get("cpu", ""), product.get("gpu", ""),
-            product.get("memory", ""), product.get("storage", ""),
+            cpu_field, product.get("gpu", ""),
+            product.get("memory", ""), storage_field,
             product.get("network", ""), chassis,
-            " ".join(tags)
+            " ".join(tags),
+            cpu_family,
         ]
         product["_search_text"] = " ".join(search_parts).lower()
     
@@ -249,57 +284,39 @@ class ProductCatalog:
         max_results: int = 50,
     ) -> List[Dict]:
         """
-        Filter products using structured criteria from the query planner.
-        
-        This is much more precise than keyword search — it does exact field
-        matching on form_factor and tags, with optional keyword refinement.
-        
+        Filter products using exact structural criteria from the query planner.
+
+        Only uses unambiguous exact-match filters (form_factor, tags).
+        Keywords are accepted for API compatibility but NOT used for filtering
+        -- the LLM handles vocabulary matching natively when it receives the
+        filtered product list alongside RAG context.
+
         Args:
             form_factor: Exact form factor to match ("1U", "2U", etc.)
             tags: Product must have ALL of these tags
-            keywords: Additional free-text terms to match in _search_text
+            keywords: Accepted but unused (kept for call-site compatibility)
             max_results: Maximum products to return
-            
+
         Returns:
-            Filtered product list, sorted by relevance
+            Filtered product list, sorted by data richness
         """
-        results = self.products  # Start with all products
-        
-        # Filter by form factor (exact match)
+        results = self.products
+
         if form_factor:
             results = [p for p in results if p.get("form_factor") == form_factor]
-        
-        # Filter by tags (product must have ALL requested tags)
+
         if tags:
             tag_set = set(tags)
             results = [p for p in results if tag_set.issubset(p.get("tags", set()))]
-        
-        # Filter by keywords (all keywords must appear in search text)
-        # Multi-word keywords like "nvidia h100" are split into individual terms
-        # and ALL terms must appear (but not necessarily as an exact phrase).
-        if keywords:
-            def matches_all_keywords(product):
-                text = product.get("_search_text", "")
-                for kw in keywords:
-                    # Split multi-word keywords into individual terms
-                    terms = kw.lower().split()
-                    for term in terms:
-                        if term not in text:
-                            return False
-                return True
-            results = [p for p in results if matches_all_keywords(p)]
-        
-        # Sort: tagged products with more detail sort first
-        # Score by how many populated spec fields they have
+
         def richness(p):
             score = 0
             for field in ["cpu", "gpu", "memory", "storage", "network", "price_range"]:
                 if p.get(field):
                     score += 1
-            return -score  # Negative for descending sort
-        
+            return -score
         results.sort(key=lambda p: (richness(p), p.get("name", "")))
-        
+
         return results[:max_results]
 
     def format_for_llm(self, products: List[Dict], max_products: int = 30) -> str:

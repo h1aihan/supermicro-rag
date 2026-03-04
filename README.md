@@ -128,7 +128,7 @@ docker run -d --name supermicro-rag -p 8000:8000 \
   -v ~/pages:/app/data/pages:ro \
   -e ANTHROPIC_API_KEY="sk-ant-..." \
   -e LLM_PROVIDER=anthropic \
-  -e ANTHROPIC_MODEL=claude-opus-4-5 \
+  -e ANTHROPIC_MODEL=claude-sonnet-4-5 \
   -e INDEX_DIR=/app/embeddings/faiss_index \
   -e TOP_K=15 \
   <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/supermicro-rag:latest

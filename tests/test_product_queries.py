@@ -439,6 +439,68 @@ PRODUCT_TEST_QUERIES = [
         "query": "Which servers are compatible with NVIDIA RTX 6000 Pro GPUs?",
         "expect": "Workstation or GPU server models supporting RTX 6000 Pro",
     },
+    # --- Accessory / part number lookups (cross-document graph traversal) ---
+    {
+        "id": "accessory_railkit_511r",
+        "category": "accessory",
+        "query": "Find me the rail kit part number for SYS-511R-M",
+        "expect": "MCP-290-00056-0N or similar rail kit SKU compatible with 813M chassis",
+    },
+    {
+        "id": "accessory_psu_options_1u",
+        "category": "accessory",
+        "query": "What power supply options are available for 1U servers?",
+        "expect": "PWS-series 1U power supply models with wattage info",
+    },
+    {
+        "id": "accessory_cable_mgmt_1u",
+        "category": "accessory",
+        "query": "Do you have a cable management arm for 1U chassis?",
+        "expect": "MCP-290 cable management arm part numbers for 1U",
+    },
+    {
+        "id": "accessory_railkit_2u",
+        "category": "accessory",
+        "query": "What rail kit do I need for a 2U rackmount server?",
+        "expect": "2U rail kit part numbers (MCP-290 series)",
+    },
+    {
+        "id": "accessory_compatible_addons",
+        "category": "accessory",
+        "query": "What add-on cards are compatible with SYS-521GE-TNRT?",
+        "expect": "AOC or add-on card part numbers compatible with this GPU server",
+    },
+    # --- Multi-constraint product discovery ---
+    {
+        "id": "discovery_dual_2u_epyc_12bay",
+        "category": "discovery",
+        "query": "Find me a dual processor 2U AMD EPYC 9005 system that supports 12 3.5 drive bays",
+        "expect": "AS-2025HS-TNR or similar 2U dual EPYC with 12x 3.5 inch bays",
+    },
+    {
+        "id": "discovery_1u_single_nvme",
+        "category": "discovery",
+        "query": "I need a 1U single processor server with at least 10 NVMe drive bays",
+        "expect": "1U single-socket systems with 10+ NVMe bays (e.g., SYS-111C-NR, AS-1115CS-TNR)",
+    },
+    {
+        "id": "discovery_2u_dual_xeon_24dimm",
+        "category": "discovery",
+        "query": "Show me 2U dual Intel Xeon servers with 24 or more DIMM slots",
+        "expect": "2U dual-socket Xeon systems with high memory capacity",
+    },
+    {
+        "id": "discovery_1u_dual_gpu_capable",
+        "category": "discovery",
+        "query": "What 1U dual processor servers support GPUs?",
+        "expect": "1U dual-socket systems with GPU support listed",
+    },
+    {
+        "id": "discovery_2u_storage_sas",
+        "category": "discovery",
+        "query": "Find a 2U server with SAS drive support and hot-swap bays",
+        "expect": "2U systems with SAS-capable hot-swap storage configurations",
+    },
 ]
 
 

@@ -16,7 +16,7 @@ import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
@@ -80,7 +80,6 @@ def _startup_log() -> None:
         flush=True,
     )
 
-# Optional CORS (only needed if hosting UI separately)
 cors_origins = _csv_env("CORS_ORIGINS")
 if cors_origins:
     app.add_middleware(
@@ -177,31 +176,44 @@ def search_documents(q: str, limit: int = 10):
     return {"results": matching_files, "count": len(matching_files)}
 
 
+def _build_conversation_context(history) -> str:
+    """Convert chat history into a conversation context string."""
+    if not history:
+        return ""
+    history_parts = []
+    for msg in history[-6:]:
+        role = "User" if msg.role == "user" else "Assistant"
+        history_parts.append(f"{role}: {msg.content}")
+    if history_parts:
+        return "\n".join(history_parts) + "\n\n"
+    return ""
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     bot = get_chatbot()
-    
-    # Format conversation history if provided
-    conversation_context = ""
-    print(f"[DEBUG] Received history: {len(req.history) if req.history else 0} messages")
-    if req.history:
-        print(f"[DEBUG] History content: {[h.role + ': ' + h.content[:50] + '...' for h in req.history]}")
-        history_parts = []
-        for msg in req.history[-6:]:  # Keep last 6 messages (3 turns) for context
-            role = "User" if msg.role == "user" else "Assistant"
-            history_parts.append(f"{role}: {msg.content}")
-        if history_parts:
-            conversation_context = "\n".join(history_parts) + "\n\n"
-    
-    # Combine history with current message for context-aware retrieval
-    full_query = req.message
-    if conversation_context:
-        # Add conversation context to help with follow-up questions
-        full_query = f"{conversation_context}Current question: {req.message}"
-    
+    conversation_context = _build_conversation_context(req.history)
     result = bot.answer(req.message, conversation_context=conversation_context)
     return {
         "answer": result.get("answer", ""),
         "sources": result.get("sources", []),
     }
+
+
+@app.post("/api/chat/stream")
+def chat_stream(req: ChatRequest):
+    """SSE streaming endpoint. Emits events: sources, token, done."""
+    bot = get_chatbot()
+    conversation_context = _build_conversation_context(req.history)
+
+    def event_generator():
+        for event, data in bot.answer_stream(req.message, conversation_context=conversation_context):
+            safe = data.replace("\n", "\\n")
+            yield f"event: {event}\ndata: {safe}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 

@@ -3,12 +3,14 @@
 Main chatbot interface for Supermicro RAG system.
 """
 
+import json
 import os
 import re
 import argparse
-from typing import Optional
+from typing import Dict, List, Optional, Set
 from pathlib import Path
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 # Support running as:
@@ -81,6 +83,12 @@ GPU names (H100, H200, B200) are NVIDIA's names, not Supermicro's. Datasheets us
 # ---------------------------------------------------------------------------
 _llm_usage = defaultdict(int)
 
+# ---------------------------------------------------------------------------
+# Cached LLM clients (avoid re-instantiating on every call)
+# ---------------------------------------------------------------------------
+_openai_client = None
+_anthropic_client = None
+
 
 def get_llm_usage() -> dict:
     """Return accumulated main-LLM token usage since last reset."""
@@ -108,6 +116,7 @@ def get_llm_response(prompt: str, model: str = "gpt-5.2", provider: str = "opena
     """
     if provider == "openai":
         try:
+            global _openai_client
             from openai import OpenAI
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
@@ -117,7 +126,9 @@ def get_llm_response(prompt: str, model: str = "gpt-5.2", provider: str = "opena
                     "Then re-run the chatbot (or set LLM_PROVIDER=ollama to avoid OpenAI)."
                 )
 
-            client = OpenAI(api_key=api_key)
+            if _openai_client is None:
+                _openai_client = OpenAI(api_key=api_key)
+            client = _openai_client
             
             response = client.chat.completions.create(
                 model=model,
@@ -139,6 +150,7 @@ def get_llm_response(prompt: str, model: str = "gpt-5.2", provider: str = "opena
     
     elif provider == "anthropic":
         try:
+            global _anthropic_client
             from anthropic import Anthropic
             api_key = os.getenv("ANTHROPIC_API_KEY")
             if not api_key:
@@ -148,7 +160,9 @@ def get_llm_response(prompt: str, model: str = "gpt-5.2", provider: str = "opena
                     "Then re-run the chatbot."
                 )
             
-            client = Anthropic(api_key=api_key)
+            if _anthropic_client is None:
+                _anthropic_client = Anthropic(api_key=api_key)
+            client = _anthropic_client
             anthropic_model = model if "claude" in model.lower() else os.getenv("ANTHROPIC_MODEL", "claude-opus-4-5")
             
             kwargs = dict(
@@ -205,6 +219,75 @@ def get_llm_response(prompt: str, model: str = "gpt-5.2", provider: str = "opena
         return f"Unknown LLM provider: {provider}"
 
 
+def get_llm_response_stream(prompt: str, model: str = "gpt-5.2", provider: str = "openai",
+                            temperature: float = 0.5, top_p: float = 1.0):
+    """Yield text chunks from the LLM as they arrive (streaming)."""
+    if provider == "openai":
+        global _openai_client
+        from openai import OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            yield "Missing OPENAI_API_KEY."
+            return
+        if _openai_client is None:
+            _openai_client = OpenAI(api_key=api_key)
+        stream = _openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            top_p=top_p,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+
+    elif provider == "anthropic":
+        global _anthropic_client
+        from anthropic import Anthropic
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            yield "Missing ANTHROPIC_API_KEY."
+            return
+        if _anthropic_client is None:
+            _anthropic_client = Anthropic(api_key=api_key)
+        anthropic_model = model if "claude" in model.lower() else os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+        kwargs = dict(
+            model=anthropic_model,
+            max_tokens=2048,
+            system=[{
+                "type": "text",
+                "text": SYSTEM_MESSAGE,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if top_p < 1.0:
+            kwargs["top_p"] = top_p
+        else:
+            kwargs["temperature"] = temperature
+        with _anthropic_client.messages.stream(**kwargs) as stream:
+            for text in stream.text_stream:
+                yield text
+            response = stream.get_final_message()
+            if hasattr(response, "usage") and response.usage:
+                _llm_usage["input_tokens"] += response.usage.input_tokens
+                _llm_usage["output_tokens"] += response.usage.output_tokens
+                _llm_usage["cache_read"] += getattr(response.usage, "cache_read_input_tokens", 0)
+                _llm_usage["cache_creation"] += getattr(response.usage, "cache_creation_input_tokens", 0)
+                _llm_usage["calls"] += 1
+
+    elif provider == "ollama":
+        yield from [get_llm_response(prompt, model, provider, temperature, top_p)]
+
+    else:
+        yield f"Unknown LLM provider: {provider}"
+
+
 class SupermicroChatbot:
     """Main chatbot class."""
     
@@ -236,33 +319,158 @@ class SupermicroChatbot:
         self.top_k = top_k
         self.temperature = temperature
         self.top_p = top_p
-        
+
         # Structured product catalog for listing/enumeration queries
-        self.catalog = ProductCatalog()  # path from PRODUCTS_FILE env or default data/pages/products.jsonl
+        self.catalog = ProductCatalog()
+
+        # Entity-relationship graph for multi-hop retrieval
+        self.entity_graph = self._load_entity_graph(index_dir)
     
-    def answer(self, question: str, conversation_context: str = "") -> dict:
+    @staticmethod
+    def _load_entity_graph(index_dir: str) -> Dict:
+        graph_path = os.path.join(index_dir, "entity_graph.json")
+        if os.path.exists(graph_path):
+            with open(graph_path) as f:
+                graph = json.load(f)
+            print(f"[EntityGraph] Loaded graph: {len(graph)} entities")
+            return graph
+        print("[EntityGraph] No entity_graph.json found — graph expansion disabled")
+        return {}
+
+    def _expand_via_graph(
+        self,
+        query_entities: List[str],
+        existing_chunks: list,
+        max_hops: int = 2,
+        max_extra_chunks: int = 6,
+    ) -> list:
+        """Follow entity-graph edges to pull in related chunks not yet retrieved.
+
+        Returns additional chunks (does NOT include the existing ones).
         """
-        Answer a question using RAG.
-        
-        Args:
-            question: User question
-            conversation_context: Previous conversation turns for context
-            
-        Returns:
-            Dictionary with answer, sources, and retrieved chunks
+        if not self.entity_graph or not query_entities:
+            return []
+
+        # Collect all chunk source files already retrieved
+        existing_sources: Set[str] = set()
+        for c in existing_chunks:
+            existing_sources.add(c.get("source_file", "").upper())
+
+        # BFS up to max_hops
+        visited: Set[str] = set()
+        frontier: Set[str] = set()
+        for entity in query_entities:
+            key = entity.upper()
+            if key in self.entity_graph:
+                frontier.add(key)
+
+        related_entities: List[str] = []
+
+        for _hop in range(max_hops):
+            next_frontier: Set[str] = set()
+            for node in frontier:
+                if node in visited:
+                    continue
+                visited.add(node)
+                node_data = self.entity_graph.get(node, {})
+                for edge in node_data.get("edges", []):
+                    target = edge["target"]
+                    if target not in visited:
+                        next_frontier.add(target)
+                        related_entities.append(target)
+            frontier = next_frontier
+
+        if not related_entities:
+            return []
+
+        print(f"[EntityGraph] Graph expansion: {query_entities} → {len(related_entities)} related entities")
+
+        # Prioritize accessory entities (MCP-, PWS-, AOC-, FAN-, CBL-) over
+        # generic entities like CPU families to keep results relevant
+        _accessory_prefix = re.compile(r"^(MCP|PWS|AOC|FAN|CBL)-", re.IGNORECASE)
+        accessories_first = sorted(
+            related_entities,
+            key=lambda e: (0 if _accessory_prefix.match(e) else 1),
+        )
+
+        extra_chunks = []
+        seen_ids = {c.get("chunk_id") for c in existing_chunks}
+
+        for entity in accessories_first:
+            if len(extra_chunks) >= max_extra_chunks:
+                break
+
+            node_data = self.entity_graph.get(entity, {})
+            chunk_ids = node_data.get("chunk_ids", [])
+
+            already_have = any(cid in seen_ids for cid in chunk_ids)
+            if already_have:
+                continue
+
+            # Skip family nodes themselves -- they're structural, not content-bearing
+            if node_data.get("type") == "chassis_family":
+                continue
+
+            retrieved = self.query_processor.retrieve(entity, top_k=3, max_per_source=2)
+            added = 0
+            for rc in retrieved:
+                cid = rc.get("chunk_id")
+                if cid not in seen_ids and added < 2:
+                    seen_ids.add(cid)
+                    rc["_graph_expanded"] = True
+                    extra_chunks.append(rc)
+                    added += 1
+
+            if added:
+                print(f"[EntityGraph]   +{added} chunks for related entity '{entity}'")
+
+        return extra_chunks[:max_extra_chunks]
+
+    def answer(self, question: str, conversation_context: str = "") -> dict:
+        """Answer a question using RAG (non-streaming)."""
+        ctx = self._retrieve_context(question, conversation_context)
+
+        if ctx["prompt"] is None:
+            return {
+                "answer": "No relevant information found in the documentation.",
+                "sources": ctx["sources"],
+                "chunks": ctx["chunks"],
+                "plan": ctx["plan"],
+                "search_queries": ctx["search_queries"],
+                "rag_top_k": ctx["rag_top_k"],
+                "max_per_source": ctx["max_per_source"],
+            }
+
+        answer = get_llm_response(
+            ctx["prompt"], self.llm_model, self.llm_provider,
+            self.temperature, self.top_p,
+        )
+
+        return {
+            "answer": answer,
+            "sources": ctx["sources"],
+            "chunks": ctx["chunks"],
+            "plan": ctx["plan"],
+            "search_queries": ctx["search_queries"],
+            "rag_top_k": ctx["rag_top_k"],
+            "max_per_source": ctx["max_per_source"],
+        }
+    
+    def _retrieve_context(self, question: str, conversation_context: str = "") -> dict:
+        """Shared retrieval logic used by both answer() and answer_stream().
+
+        Returns dict with keys: prompt, sources, chunks, plan, search_queries,
+        rag_top_k, max_per_source.
         """
         # =====================================================================
-        # FOLLOW-UP DETECTION — default: treat as NEW query (safe).
-        # Only use conversation context when we are ABSOLUTELY SURE it's a
-        # follow-up. A wrong follow-up pollutes retrieval with the old product.
+        # FOLLOW-UP DETECTION
         # =====================================================================
         retrieval_query = question
-        is_followup = False  # stays False unless proven otherwise
+        is_followup = False
 
         if conversation_context:
             q_clean = re.sub(r'[?!.,;:]+$', '', question.strip()).lower().strip()
 
-            # --- STEP 1: Is this an affirmative continuation? ("yes", "sure") ---
             AFFIRMATIVE = frozenset({
                 'yes', 'yeah', 'yep', 'sure', 'please', 'go ahead',
                 'ok', 'okay', 'correct', 'absolutely', 'yea',
@@ -278,22 +486,19 @@ class SupermicroChatbot:
                     is_followup = True
                     print(f"[DEBUG] Affirmative continuation → using last assistant msg ({len(retrieval_query)} chars)")
 
-            # --- STEP 2: Does it contain a product code? → ALWAYS a new query ---
             elif (
                 re.findall(r'\b(?:SYS|AS|SSG|SBI|AOC)-[\w-]+\b', question, re.IGNORECASE)
                 or re.match(r'^x\d{2}[a-z0-9-]*$', q_clean)
                 or re.match(r'^\d{3}[a-z]{2,}(?:-[a-z0-9]+)?$', q_clean)
             ):
-                # Any product identifier (full or partial) → brand new query, no conversation
                 print(f"[DEBUG] Product code detected in '{q_clean}' → NEW query (context suppressed)")
 
-            # --- STEP 3: Check for explicit referential language ---
-            # ONLY these patterns trigger follow-up. Short/vague questions do NOT.
-            # Word-boundary matching to avoid false positives ("it" in "items").
             else:
                 REFERENTIAL = [
-                    r'\bit\b', r'\bits\b', r'\bthis\b', r'\bthat\b', r'\bthose\b',
+                    r'\bit\b', r'\bits\b', r'\bthis\b',
                     r'\bthe same\b', r'\bthat one\b', r'\bthis one\b',
+                    r'\bthat system\b', r'\bthat server\b', r'\bthat model\b',
+                    r'\bthat product\b', r'\bthose servers\b', r'\bthose systems\b',
                     r'\bthe above\b', r'\bmentioned\b', r'\babove\b',
                 ]
                 CONTINUATION = [
@@ -304,9 +509,24 @@ class SupermicroChatbot:
                 has_referential = any(re.search(p, q_clean) for p in REFERENTIAL)
                 has_continuation = any(re.search(p, q_clean) for p in CONTINUATION)
 
-                if has_referential or has_continuation:
+                # Queries with multiple hardware specs are new product discovery,
+                # not follow-ups, even if they contain words like "that" as
+                # relative pronouns (e.g., "system that supports 12 drive bays")
+                _SPEC_SIGNALS = [
+                    r'\b[124]u\b',
+                    r'\bdual\s+processor\b', r'\bsingle\s+processor\b',
+                    r'\bepyc\b', r'\bxeon\b', r'\bamd\b', r'\bintel\b',
+                    r'\b\d+\s*[\d.]*["\u201d]?\s*drive\b',
+                    r'\b\d+\s*bay', r'\bnvme\b', r'\bsata\b', r'\bsas\b',
+                    r'\bgpu\b', r'\b\d+\s*dimm\b',
+                ]
+                spec_count = sum(1 for p in _SPEC_SIGNALS if re.search(p, q_clean))
+                is_product_discovery = spec_count >= 2
+
+                if is_product_discovery:
+                    print(f"[DEBUG] Product discovery query ({spec_count} spec signals) → NEW query (context suppressed)")
+                elif has_referential or has_continuation:
                     is_followup = True
-                    # Inject the most recent product code from conversation
                     all_codes = re.findall(
                         r'\b(?:SYS|AS|SSG|SBI|AOC)-[\w-]+\b',
                         conversation_context, re.IGNORECASE,
@@ -317,39 +537,31 @@ class SupermicroChatbot:
                         u = c.upper()
                         if u not in seen:
                             seen.add(u)
-                            product_code = c  # last unique code = most recent
+                            product_code = c
                     if product_code:
                         retrieval_query = f"{product_code} {question}"
                     print(f"[DEBUG] Follow-up confirmed (referential language) → query: {retrieval_query}")
                 else:
                     print(f"[DEBUG] No follow-up signals → treating as NEW query (context suppressed)")
 
-        # --- Decide what context the planner and LLM see ---
-        # Planner: only sees conversation when it's a confirmed follow-up
-        # LLM prompt: only sees conversation when it's a confirmed follow-up
-        # This prevents ANY context pollution on new queries.
         effective_conversation = conversation_context if is_followup else None
 
-        # --- Query Planning: LLM decides intent + retrieval strategy ---
         plan = plan_query(retrieval_query, conversation_context=effective_conversation)
-        
-        # --- Catalog retrieval (structured filtering) ---
+
+        # --- Catalog retrieval ---
         catalog_results = []
         if plan.use_catalog and self.catalog.products:
-            # Use structured filters from the planner (exact field matching)
             catalog_results = self.catalog.filter_structured(
                 form_factor=plan.form_factor,
                 tags=plan.tags if plan.tags else None,
                 keywords=plan.keywords if plan.keywords else None,
             )
-            # If structured filters returned nothing, fall back to keyword search
             if not catalog_results and (plan.tags or plan.keywords):
                 catalog_results = self.catalog.search(retrieval_query)
                 if catalog_results:
                     print(f"[DEBUG] Structured filter empty, keyword fallback: {len(catalog_results)} results")
-        
-        # --- Determine catalog/RAG balance and source diversity based on intent ---
-        max_per_source = None  # None = no cap (detail/follow-up want deep single-source context)
+
+        max_per_source = None
 
         if plan.intent == "list" and catalog_results:
             rag_top_k = max(self.top_k, 10)
@@ -379,21 +591,13 @@ class SupermicroChatbot:
             catalog_max = 0
             max_per_source = 3
             print(f"[DEBUG] Plan: {plan.intent} → RAG only: top {rag_top_k}, max_per_source={max_per_source}")
-        
-        # --- RAG retrieval ---
-        # The planner outputs search_queries (list). If it returns multiple,
-        # we split retrieval. If it returns one but there are multiple product
-        # codes, we auto-split on codes as a safety net.
+
         search_queries = plan.search_queries if plan.search_queries else [retrieval_query]
 
-        # Safety net: if planner returned 2+ product codes but only 1 search query,
-        # auto-split into per-product queries so each product gets its own retrieval.
         if len(plan.product_codes) >= 2 and len(search_queries) == 1:
             search_queries = [f"{code} specifications datasheet" for code in plan.product_codes]
             print(f"[DEBUG] Auto-split: planner gave 1 query but {len(plan.product_codes)} codes → {len(search_queries)} queries")
 
-        # Inject product codes only for SINGLE queries (safety net).
-        # For split queries, each already targets a specific product — don't cross-contaminate.
         if len(search_queries) == 1 and plan.product_codes:
             for code in plan.product_codes:
                 if code.upper() not in search_queries[0].upper():
@@ -402,16 +606,16 @@ class SupermicroChatbot:
 
         rag_query = search_queries[0] if search_queries else retrieval_query
 
-        # --- Split vs single retrieval (decided by planner, not hardcoded rules) ---
         if len(search_queries) >= 2 and plan.use_rag:
             per_k = max(5, rag_top_k // len(search_queries))
             rag_top_k = max(rag_top_k, len(search_queries) * per_k)
             per_query_chunks = {}
-            for sq in search_queries:
-                per_query_chunks[sq] = self.query_processor.retrieve(sq, per_k)
-                print(f"[DEBUG]   '{sq[:60]}' → {len(per_query_chunks[sq])} chunks")
+            with ThreadPoolExecutor(max_workers=len(search_queries)) as pool:
+                futures = {sq: pool.submit(self.query_processor.retrieve, sq, per_k) for sq in search_queries}
+                for sq, fut in futures.items():
+                    per_query_chunks[sq] = fut.result()
+                    print(f"[DEBUG]   '{sq[:60]}' → {len(per_query_chunks[sq])} chunks")
 
-            # Round-robin interleave so each topic gets fair representation
             chunks = []
             seen_ids = set()
             max_rounds = max((len(v) for v in per_query_chunks.values()), default=0)
@@ -430,12 +634,6 @@ class SupermicroChatbot:
         else:
             chunks = self.query_processor.retrieve(rag_query, rag_top_k, max_per_source=max_per_source) if plan.use_rag else []
 
-        # --- Product code safety net ---
-        # When the planner identified specific product codes, verify that we actually
-        # retrieved chunks from those products. If a product's documents are missing,
-        # do a focused retrieval using just the product code to pull in its datasheet.
-        # This prevents topic-heavy queries like "does X support GPUs?" from drowning
-        # out the product's own documentation with unrelated GPU server docs.
         if chunks and plan.product_codes and plan.use_rag:
             chunk_sources = " ".join(c.get("source_file", "") for c in chunks).upper()
             missing_codes = []
@@ -448,22 +646,21 @@ class SupermicroChatbot:
                 print(f"[DEBUG] Product safety net: {missing_codes} not in retrieved sources, doing focused retrieval")
                 rescue_slots = max(3, rag_top_k // 3)
                 seen_ids = {c.get("chunk_id") for c in chunks}
-                for code in missing_codes:
-                    rescue_chunks = self.query_processor.retrieve(code, rescue_slots)
-                    added = 0
-                    for rc in rescue_chunks:
-                        cid = rc.get("chunk_id")
-                        if cid not in seen_ids:
-                            seen_ids.add(cid)
-                            chunks.append(rc)
-                            added += 1
-                    if added:
-                        print(f"[DEBUG]   Rescued {added} chunks for '{code}'")
+                with ThreadPoolExecutor(max_workers=len(missing_codes)) as pool:
+                    futures = {code: pool.submit(self.query_processor.retrieve, code, rescue_slots) for code in missing_codes}
+                    for code, fut in futures.items():
+                        rescue_chunks = fut.result()
+                        added = 0
+                        for rc in rescue_chunks:
+                            cid = rc.get("chunk_id")
+                            if cid not in seen_ids:
+                                seen_ids.add(cid)
+                                chunks.append(rc)
+                                added += 1
+                        if added:
+                            print(f"[DEBUG]   Rescued {added} chunks for '{code}'")
                 chunks = chunks[:rag_top_k + len(missing_codes) * rescue_slots]
 
-        # When query is specifically about motherboard PRODUCTS, drop chunks from clearly non-motherboard sources.
-        # Only trigger when "motherboard" is the topic (e.g., "X13DEI motherboard"), not when it
-        # appears incidentally (e.g., "Global SKU Program list Systems Motherboards Chassis").
         _mb_topic = (
             "motherboard" in question.lower()
             or (plan.intent == "detail" and any("X1" in c.upper() or "MBD-" in c.upper() for c in plan.product_codes))
@@ -476,14 +673,31 @@ class SupermicroChatbot:
             if len(filtered) >= 3:
                 chunks = filtered[:rag_top_k]
                 print(f"[DEBUG] Motherboard query: filtered to {len(chunks)} chunks (dropped non-motherboard sources)")
-        
+
+        # --- Graph expansion for multi-hop retrieval ---
+        # 3 hops needed for: system → chassis → family → accessory
+        graph_chunks = []
+        if self.entity_graph and plan.accessory_query and plan.product_codes:
+            graph_chunks = self._expand_via_graph(
+                plan.product_codes, chunks,
+                max_hops=3, max_extra_chunks=6,
+            )
+        elif self.entity_graph and plan.product_codes:
+            _accessory_kw = re.compile(
+                r"rail\s*kit|part\s*number|accessory|cable|psu|power\s*supply|compatible|add-on\s*card|aoc-|mcp-|fan\s*module",
+                re.IGNORECASE,
+            )
+            if _accessory_kw.search(question):
+                graph_chunks = self._expand_via_graph(
+                    plan.product_codes, chunks,
+                    max_hops=3, max_extra_chunks=6,
+                )
+
         # --- Build combined context ---
         context_parts = []
-        
         if catalog_results and catalog_max > 0:
             catalog_context = self.catalog.format_for_llm(catalog_results, max_products=catalog_max)
             context_parts.append(f"PRODUCT CATALOG DATA:\n{catalog_context}")
-        
         if chunks:
             rag_context = self.query_processor.format_context(chunks)
             label = "DOCUMENTATION CONTEXT:" if catalog_results and catalog_max > 0 else ""
@@ -491,35 +705,11 @@ class SupermicroChatbot:
                 context_parts.append(f"{label}\n{rag_context}")
             else:
                 context_parts.append(rag_context)
-        
-        if not context_parts:
-            return {
-                "answer": "No relevant information found in the documentation.",
-                "sources": [],
-                "chunks": [],
-                "plan": plan,
-                "search_queries": search_queries,
-                "rag_top_k": rag_top_k,
-                "max_per_source": max_per_source,
-            }
-        
-        context = "\n\n".join(context_parts)
+        if graph_chunks:
+            graph_context = self.query_processor.format_context(graph_chunks)
+            context_parts.append(f"RELATED PRODUCT DATA (from linked documents):\n{graph_context}")
+
         sources_from_catalog = catalog_results[:catalog_max] if catalog_max > 0 else []
-        if sources_from_catalog and chunks:
-            print(f"[DEBUG] Context: BOTH catalog ({len(sources_from_catalog)} products) and RAG ({len(chunks)} chunks) sent to LLM")
-        elif sources_from_catalog:
-            print(f"[DEBUG] Context: catalog only ({len(sources_from_catalog)} products)")
-        elif chunks:
-            print(f"[DEBUG] Context: RAG only ({len(chunks)} chunks)")
-        
-        # Build prompt — only include conversation when confirmed follow-up
-        prompt = self._build_user_prompt(question, context, chunks, effective_conversation)
-        
-        # Get LLM response
-        answer = get_llm_response(prompt, self.llm_model, self.llm_provider,
-                                  self.temperature, self.top_p)
-        
-        # Extract unique sources (preserve ranking order - first occurrence wins)
         seen = set()
         sources = []
         if sources_from_catalog:
@@ -530,11 +720,19 @@ class SupermicroChatbot:
             if src not in seen:
                 seen.add(src)
                 sources.append(src)
-        
-        print(f"[DEBUG] Top {len(sources)} sources: {sources[:10]}")
-        
+        for chunk in graph_chunks:
+            src = chunk["source_file"]
+            if src not in seen:
+                seen.add(src)
+                sources.append(src)
+
+        prompt = None
+        if context_parts:
+            context = "\n\n".join(context_parts)
+            prompt = self._build_user_prompt(question, context, chunks, effective_conversation)
+
         return {
-            "answer": answer,
+            "prompt": prompt,
             "sources": sources,
             "chunks": chunks,
             "plan": plan,
@@ -542,7 +740,30 @@ class SupermicroChatbot:
             "rag_top_k": rag_top_k,
             "max_per_source": max_per_source,
         }
-    
+
+    def answer_stream(self, question: str, conversation_context: str = ""):
+        """Yield (event, data) tuples for SSE streaming.
+
+        Events: ("sources", json_list), ("token", text), ("done", "").
+        """
+        import json as _json
+        ctx = self._retrieve_context(question, conversation_context)
+
+        yield ("sources", _json.dumps(ctx["sources"]))
+
+        if ctx["prompt"] is None:
+            yield ("token", "No relevant information found in the documentation.")
+            yield ("done", "")
+            return
+
+        for token in get_llm_response_stream(
+            ctx["prompt"], self.llm_model, self.llm_provider,
+            self.temperature, self.top_p,
+        ):
+            yield ("token", token)
+
+        yield ("done", "")
+
     def _build_user_prompt(self, question: str, context: str, chunks: list, conversation_context: str = "") -> str:
         """
         Build a structured user prompt for the LLM.
