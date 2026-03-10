@@ -300,6 +300,7 @@ class HybridIndex:
         keyword_weight: float = None,   # None = auto-detect
         rrf_k: int = 60,
         max_per_source: Optional[int] = None,
+        source_filter: Optional[str] = None,
     ) -> List[Tuple[Dict, float]]:
         """
         Hybrid search combining semantic and keyword search using Reciprocal Rank Fusion.
@@ -315,10 +316,19 @@ class HybridIndex:
             semantic_weight: Weight for semantic search (None = auto-detect)
             keyword_weight: Weight for keyword search (None = auto-detect)
             rrf_k: RRF constant (higher = more weight to lower-ranked items)
+            source_filter: If set, only include chunks whose source_file contains this string
             
         Returns:
             List of (chunk_dict, score) tuples
         """
+        allowed_indices = None
+        if source_filter:
+            allowed_indices = {i for i, m in enumerate(self.metadata)
+                               if source_filter in m.get('source_file', '')}
+            if not allowed_indices:
+                print(f"[DEBUG] source_filter='{source_filter}' matched 0 chunks, falling back to unfiltered")
+                allowed_indices = None
+
         # Auto-detect weights based on query type
         if semantic_weight is None or keyword_weight is None:
             if self._is_product_code_query(query):
@@ -334,13 +344,18 @@ class HybridIndex:
                 semantic_weight = 0.5
                 keyword_weight = 0.5
         
-        # Get results from both methods (fetch more for better fusion coverage)
-        fetch_k = max(top_k * 5, 30)
+        # Fetch more candidates when filtering to compensate for post-filter loss
+        fetch_k = max(top_k * 5, 30) if not allowed_indices else max(top_k * 20, 200)
         semantic_results = self.search_semantic(query, fetch_k)
         
         # Expand query for BM25 (add synonyms/stemmed variants)
         bm25_query = self._expand_query_for_bm25(query)
         keyword_results = self.search_keyword(bm25_query, fetch_k)
+
+        # Apply source filter to channel results
+        if allowed_indices is not None:
+            semantic_results = [(idx, s) for idx, s in semantic_results if idx in allowed_indices]
+            keyword_results = [(idx, s) for idx, s in keyword_results if idx in allowed_indices]
         
         # Calculate RRF scores
         rrf_scores = {}
@@ -357,6 +372,8 @@ class HybridIndex:
 
         # Third channel: filename matching (helps product family queries)
         filename_results = self.search_by_filename(query, fetch_k)
+        if allowed_indices is not None:
+            filename_results = [(idx, s) for idx, s in filename_results if idx in allowed_indices]
         if filename_results:
             best_match_score = filename_results[0][1]
             filename_weight = 1.0 if best_match_score >= 2 else 0.3

@@ -182,6 +182,7 @@ class RAGQueryProcessor:
         query: str, 
         top_k: int = 10,
         max_per_source: Optional[int] = None,
+        source_filter: Optional[str] = None,
     ) -> List[Dict]:
         """
         Retrieve relevant chunks using hybrid search.
@@ -194,6 +195,7 @@ class RAGQueryProcessor:
             query: User query
             top_k: Number of chunks to return
             max_per_source: If set, cap chunks per source file for diversity
+            source_filter: If set, restrict to chunks whose source_file contains this string
             
         Returns:
             List of chunk dictionaries with similarity scores
@@ -202,7 +204,8 @@ class RAGQueryProcessor:
         expanded_query = preprocess_query(query)
         
         # Step 2: Hybrid search
-        results = self.index.search_hybrid(expanded_query, top_k, max_per_source=max_per_source)
+        results = self.index.search_hybrid(expanded_query, top_k, max_per_source=max_per_source,
+                                           source_filter=source_filter)
         
         # Convert to list of dicts
         chunks = []

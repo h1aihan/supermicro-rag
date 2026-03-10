@@ -501,6 +501,104 @@ PRODUCT_TEST_QUERIES = [
         "query": "Find a 2U server with SAS drive support and hot-swap bays",
         "expect": "2U systems with SAS-capable hot-swap storage configurations",
     },
+    # --- FAQ / eStore operational questions ---
+    {
+        "id": "faq_return_policy",
+        "category": "faq",
+        "query": "What is the return policy for Supermicro eStore?",
+        "expect": "30-day return window; software/lifestyle non-returnable; restocking fee up to 15%",
+    },
+    {
+        "id": "faq_shipping_international",
+        "category": "faq",
+        "query": "Does Supermicro ship internationally?",
+        "expect": "US and Canada only; does not ship to US territories",
+    },
+    {
+        "id": "faq_payment_methods",
+        "category": "faq",
+        "query": "What payment methods does Supermicro eStore accept?",
+        "expect": "Visa, MasterCard, American Express, Discover; no check/money order/PO",
+    },
+    {
+        "id": "faq_cancel_order",
+        "category": "faq",
+        "query": "How do I cancel my order on the eStore?",
+        "expect": "Cancel via My Account > My Orders; cancellation is permanent",
+    },
+    {
+        "id": "faq_warranty_servers",
+        "category": "faq",
+        "query": "What is the warranty on Supermicro eStore servers?",
+        "expect": "3-year labor and parts; 1-year cross-shipping; extended warranty must be added at purchase",
+    },
+    {
+        "id": "faq_software_license_key",
+        "category": "faq",
+        "query": "Where do I find and generate my software license key on the eStore?",
+        "expect": "My Account > My Software for Software Orders, Product Keys, Generate Key; see Generation Software Key guide",
+    },
+    {
+        "id": "faq_tax_exemption",
+        "category": "faq",
+        "query": "How do I apply for tax exemption on the eStore?",
+        "expect": "Apply through eStore account > My Account > tax exemption link; reviewed within 1 business day",
+    },
+    {
+        "id": "faq_free_shipping",
+        "category": "faq",
+        "query": "Does Supermicro offer free shipping?",
+        "expect": "Free shipping within Continental US on purchases over $200 before tax",
+    },
+    # --- FAQ wording variation tests ---
+    {
+        "id": "faq_var_refund_wording",
+        "category": "faq",
+        "query": "Can I get a refund if I changed my mind about a purchase?",
+        "expect": "30-day return window; restocking fee up to 15%; must obtain RMA",
+    },
+    {
+        "id": "faq_var_guest_checkout",
+        "category": "faq",
+        "query": "Can I order from the eStore without creating an account?",
+        "expect": "Account is required to place an order; no guest checkout available",
+    },
+    {
+        "id": "faq_var_backorder_partial_ship",
+        "category": "faq",
+        "query": "If part of my order is backordered, will you send what's available now?",
+        "expect": "Entire order ships together; recommend placing separate orders",
+    },
+    {
+        "id": "faq_var_password_requirements",
+        "category": "faq",
+        "query": "My new password keeps getting rejected, what are the rules?",
+        "expect": "At least 12 characters; requires lowercase, uppercase, digit, special character",
+    },
+    {
+        "id": "faq_var_combine_accounts",
+        "category": "faq",
+        "query": "I have two eStore accounts, can you merge them?",
+        "expect": "No option to combine accounts",
+    },
+    {
+        "id": "faq_var_credit_card_types",
+        "category": "faq",
+        "query": "Can I pay with PayPal or a wire transfer?",
+        "expect": "PayPal accepted; wire transfer available (contact support to enable); one payment method per order",
+    },
+    {
+        "id": "faq_var_track_my_order",
+        "category": "faq",
+        "query": "How can I check where my package is right now?",
+        "expect": "Tracking info available via My Account > My Orders or shipment confirmation email",
+    },
+    {
+        "id": "faq_var_tax_canada_reseller",
+        "category": "faq",
+        "query": "I'm reselling from Canada, do I still get charged sales tax?",
+        "expect": "No tax on orders shipped to Canada",
+    },
 ]
 
 
@@ -706,7 +804,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Run product queries and print results")
     parser.add_argument("--dry-run", action="store_true", help="Only print queries, do not call chatbot")
-    parser.add_argument("--category", choices=["list", "detail", "compare", "general", "conversational", "recommendation", "followup", "misspell", "multi"], help="Run only this category")
+    parser.add_argument("--category", choices=["list", "detail", "compare", "general", "conversational", "recommendation", "followup", "misspell", "multi", "accessory", "discovery", "faq"], help="Run only this category")
     parser.add_argument("--id", dest="query_id", help="Run only the test with this id (e.g. list_1u)")
     parser.add_argument("--summary", action="store_true", help="Print a one-line quality hint after each answer and a summary at the end")
     parser.add_argument("--output", "-o", dest="output_file", metavar="FILE", help="Write test output to FILE (same as terminal)")
@@ -859,8 +957,8 @@ def test_product_query_returns_answer(product_query):
 
 
 def test_product_query_list_has_sources(product_query):
-    """Listing, detail, and recommendation queries should typically have at least one source."""
-    if product_query["category"] not in ("list", "detail", "conversational", "recommendation"):
+    """Listing, detail, recommendation, and FAQ queries should typically have at least one source."""
+    if product_query["category"] not in ("list", "detail", "conversational", "recommendation", "faq"):
         return  # skip for compare/general/followup
     chatbot = get_chatbot()
     result = chatbot.answer(product_query["query"])

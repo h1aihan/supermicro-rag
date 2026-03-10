@@ -224,8 +224,10 @@ def rag_content_to_document(content: Dict) -> Optional[Dict]:
     
     text = '\n'.join(parts)
     
-    # Skip entries with less than 200 chars of useful content (after cleaning)
-    if len(text) < 200:
+    # FAQ entries are intentionally short (Q&A pairs); use a lower threshold
+    category = content.get('category', '')
+    min_chars = 80 if category.startswith("FAQ") else 200
+    if len(text) < min_chars:
         return None
     
     # Create document in same format as extract.py output
@@ -290,9 +292,10 @@ def process_pages(input_dir: str, output_dir: str):
         print(f"Processing RAG content from {rag_file}...")
         idx = 0
         for content in tqdm(load_jsonl(rag_file), desc="RAG Content"):
-            # Dedup by URL path
+            # Dedup by URL path (skip for FAQ entries — they share a base URL)
+            is_faq = content.get('category', '').startswith("FAQ")
             url = content.get('url', '')
-            if url:
+            if url and not is_faq:
                 url_path = normalize_url_path(url)
                 if url_path in seen_url_paths:
                     skipped_dup_url += 1

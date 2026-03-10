@@ -145,7 +145,7 @@ AMD CPU generation to Supermicro platform mapping:
 
 ## OUTPUT FORMAT (JSON only, no markdown)
 {
-  "intent": "list|detail|compare|general|follow_up",
+  "intent": "list|detail|compare|general|follow_up|faq",
   "product_codes": [],
   "form_factor": null or "1U"|"2U"|"4U"|"8U"|"Mid-Tower",
   "tags": [],
@@ -228,7 +228,22 @@ Rules for spec-based discovery:
 - Set form_factor if the user specified one
 - Generate ONE search query that concatenates the key specs naturally
 
+## FAQ / eSTO​RE OPERATIONAL QUESTIONS
+When the user asks about eStore policies, processes, or account management — NOT about product specs or hardware — use intent="faq". These are customer-service questions about ordering, shipping, returns/RMA/warranty, payments, account management, tax exemption, software licensing, or the eStore website itself.
+
+Rules for FAQ queries:
+- intent=faq, use_catalog=false, use_rag=true
+- ALWAYS prefix the search query with "FAQ" then keep the user's original question close to its original wording
+- You may substitute slang or indirect phrasing with the core FAQ topic keyword, but do NOT invent extra keywords that the user didn't imply
+- Do NOT set form_factor, tags, or product_codes — these are not product queries
+
+Distinguishing FAQ from other intents:
+- FAQ = eStore operational questions (policies, account, ordering process)
+- detail = product specs or hardware questions about a specific model
+- general = broad technical concepts not tied to eStore operations
+
 ## GUIDELINES
+- For "faq" intent: use_catalog=false, use_rag=true
 - For "list" intent: use_catalog=true, use_rag=true (catalog for product data, RAG for supplementary context)
 - For "detail" intent: use_catalog=true (if asking about a specific model), use_rag=true
 - For "compare" intent: use_catalog=true, use_rag=true
@@ -363,7 +378,7 @@ def _call_planner_llm(query: str, conversation_context: Optional[str] = None) ->
 # Parse LLM response into QueryPlan
 # =============================================================================
 
-VALID_INTENTS = {"list", "detail", "compare", "general", "follow_up"}
+VALID_INTENTS = {"list", "detail", "compare", "general", "follow_up", "faq"}
 VALID_FORM_FACTORS = {"1U", "2U", "4U", "8U", "Mid-Tower"}
 VALID_TAGS = {
     "Gold Series", "CloudDC", "Hyper", "Edge", "Storage", "GPU",
@@ -468,6 +483,15 @@ def _fallback_plan(query: str) -> QueryPlan:
     q = query.lower()
     plan = QueryPlan(search_queries=[query], use_rag=True)
     
+    # Detect FAQ intent (eStore operational questions)
+    _faq_kw = r'\b(return policy|rma|warranty|shipping|ship internationally|payment method|cancel.{0,10}order|backorder|tax exempt|estore account|license key|refund)\b'
+    if re.search(_faq_kw, q):
+        plan.intent = "faq"
+        plan.use_catalog = False
+        plan.use_rag = True
+        print(f"[QueryPlanner] Fallback plan: {plan}")
+        return plan
+
     # Detect listing intent
     _pt = r'(skus?|servers?|systems?|products?|solutions?|models?|series|configurations?)'
     is_list = bool(

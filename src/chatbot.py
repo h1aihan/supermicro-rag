@@ -75,7 +75,15 @@ GPU names (H100, H200, B200) are NVIDIA's names, not Supermicro's. Datasheets us
 
 ### Gold Series vs Global SKU Program
 - **Gold Series** ("Quick Ship") = pre-configured products with -G1/-G2 suffix. NOT the same as Global SKUs.
-- **Global SKU Program** = logistics program. Link: https://www.supermicro.com/en/products/SMC_Global_skus — only mention when user specifically asks about "global SKUs"."""
+- **Global SKU Program** = logistics program. Link: https://www.supermicro.com/en/products/SMC_Global_skus — only mention when user specifically asks about "global SKUs".
+
+## FAQ / eSTORE QUESTIONS
+When answering eStore FAQ questions (ordering, shipping, returns, payments, account, warranty, tax, software licensing):
+- Be concise and direct. The answer is typically contained in the FAQ context provided.
+- Use a helpful customer-service tone rather than technical spec presentation.
+- Do not use markdown tables — plain text or short bullet lists are preferred.
+- If the FAQ provides a specific process (step-by-step), present it clearly.
+- If the user's question isn't covered by the FAQ context, suggest contacting Supermicro support via live chat or email."""
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +570,7 @@ class SupermicroChatbot:
                     print(f"[DEBUG] Structured filter empty, keyword fallback: {len(catalog_results)} results")
 
         max_per_source = None
+        source_filter = None
 
         if plan.intent == "list" and catalog_results:
             rag_top_k = max(self.top_k, 10)
@@ -586,6 +595,12 @@ class SupermicroChatbot:
             catalog_max = min(len(catalog_results), 10) if catalog_results else 0
             max_per_source = 3
             print(f"[DEBUG] Plan: compare → catalog: {catalog_max}, RAG: top {rag_top_k}, max_per_source={max_per_source}")
+        elif plan.intent == "faq":
+            rag_top_k = 5
+            catalog_max = 0
+            catalog_results = []
+            source_filter = "FAQ:"
+            print(f"[DEBUG] Plan: faq → RAG only: top {rag_top_k}, source_filter='{source_filter}' (no catalog, no graph)")
         else:
             rag_top_k = self.top_k
             catalog_max = 0
@@ -611,7 +626,8 @@ class SupermicroChatbot:
             rag_top_k = max(rag_top_k, len(search_queries) * per_k)
             per_query_chunks = {}
             with ThreadPoolExecutor(max_workers=len(search_queries)) as pool:
-                futures = {sq: pool.submit(self.query_processor.retrieve, sq, per_k) for sq in search_queries}
+                futures = {sq: pool.submit(self.query_processor.retrieve, sq, per_k,
+                                           source_filter=source_filter) for sq in search_queries}
                 for sq, fut in futures.items():
                     per_query_chunks[sq] = fut.result()
                     print(f"[DEBUG]   '{sq[:60]}' → {len(per_query_chunks[sq])} chunks")
@@ -632,7 +648,24 @@ class SupermicroChatbot:
             chunks = chunks[:rag_top_k]
             print(f"[DEBUG] Split retrieval: {len(search_queries)} queries, {len(chunks)} chunks (balanced)")
         else:
-            chunks = self.query_processor.retrieve(rag_query, rag_top_k, max_per_source=max_per_source) if plan.use_rag else []
+            chunks = self.query_processor.retrieve(rag_query, rag_top_k, max_per_source=max_per_source,
+                                                   source_filter=source_filter) if plan.use_rag else []
+
+        # Two-pass FAQ retrieval: primary FAQ-only chunks + supplementary general context
+        if source_filter and chunks:
+            faq_count = len(chunks)
+            supplement_slots = 2
+            seen_ids = {c.get("chunk_id") for c in chunks}
+            supplement = self.query_processor.retrieve(rag_query, 5, max_per_source=1)
+            added = 0
+            for sc in supplement:
+                if sc.get("chunk_id") not in seen_ids and source_filter not in sc.get("source_file", ""):
+                    chunks.append(sc)
+                    added += 1
+                    if added >= supplement_slots:
+                        break
+            if added:
+                print(f"[DEBUG] FAQ supplement: {faq_count} FAQ + {added} general context chunks")
 
         if chunks and plan.product_codes and plan.use_rag:
             chunk_sources = " ".join(c.get("source_file", "") for c in chunks).upper()
@@ -729,7 +762,7 @@ class SupermicroChatbot:
         prompt = None
         if context_parts:
             context = "\n\n".join(context_parts)
-            prompt = self._build_user_prompt(question, context, chunks, effective_conversation)
+            prompt = self._build_user_prompt(question, context, chunks, effective_conversation, intent=plan.intent)
 
         return {
             "prompt": prompt,
@@ -764,26 +797,14 @@ class SupermicroChatbot:
 
         yield ("done", "")
 
-    def _build_user_prompt(self, question: str, context: str, chunks: list, conversation_context: str = "") -> str:
-        """
-        Build a structured user prompt for the LLM.
-        
-        Args:
-            question: User's question
-            context: Formatted context from retrieved chunks
-            chunks: List of retrieved chunks (for metadata)
-            conversation_context: Previous conversation turns
-            
-        Returns:
-            Formatted prompt string
-        """
-        # Identify unique source types for context
+    def _build_user_prompt(self, question: str, context: str, chunks: list,
+                           conversation_context: str = "", intent: str = "general") -> str:
+        """Build a structured user prompt for the LLM."""
         source_files = list(set(chunk["source_file"] for chunk in chunks))
         source_summary = ", ".join(source_files[:5])
         if len(source_files) > 5:
             source_summary += f" (+{len(source_files) - 5} more)"
-        
-        # Include conversation history if available
+
         conversation_section = ""
         if conversation_context:
             conversation_section = f"""## CONVERSATION HISTORY
@@ -791,7 +812,19 @@ class SupermicroChatbot:
 ---
 
 """
-        
+
+        if intent == "faq":
+            instructions = (
+                "1. Answer the eStore question directly and concisely using the FAQ content provided.\n"
+                "2. Use a helpful, customer-service tone. Keep the response short — no tables or lengthy spec lists.\n"
+                "3. If the FAQ doesn't cover this specific question, suggest contacting Supermicro support via live chat or email."
+            )
+        else:
+            instructions = (
+                "1. Use the reference documents as your primary source. You may supplement with general domain knowledge for context, but never invent specific specs or part numbers.\n"
+                "2. If this is a follow-up question, use conversation history for context."
+            )
+
         prompt = f"""{conversation_section}## REFERENCE DOCUMENTS
 Sources: {source_summary}
 
@@ -803,8 +836,7 @@ Sources: {source_summary}
 {question}
 
 ## INSTRUCTIONS
-1. Use the reference documents as your primary source. You may supplement with general domain knowledge for context, but never invent specific specs or part numbers.
-2. If this is a follow-up question, use conversation history for context."""
+{instructions}"""
         
         return prompt
     

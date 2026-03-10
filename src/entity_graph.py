@@ -39,9 +39,12 @@ ENTITY_PATTERNS: Dict[str, re.Pattern] = {
     "aoc": re.compile(r"\b(AOC-[\w-]{4,})\b", re.IGNORECASE),
     "fan": re.compile(r"\b(FAN-[\w-]{4,})\b", re.IGNORECASE),
     "cable": re.compile(r"\b(CBL-[\w-]{4,})\b", re.IGNORECASE),
+    "heatsink": re.compile(r"\b(SNK-[\w-]{4,})\b", re.IGNORECASE),
+    "riser": re.compile(r"\b(RSC-[\w-]{4,})\b", re.IGNORECASE),
+    "backplane": re.compile(r"\b(BPN-[\w-]{4,})\b", re.IGNORECASE),
 }
 
-ACCESSORY_TYPES = {"accessory_mcp", "psu", "aoc", "fan", "cable"}
+ACCESSORY_TYPES = {"accessory_mcp", "psu", "aoc", "fan", "cable", "heatsink", "riser", "backplane"}
 
 # ── Regex-based relationship extraction ─────────────────────────────────────
 
@@ -53,7 +56,7 @@ _RE_MOBO_LINE = re.compile(
     re.IGNORECASE,
 )
 _RE_PARTS_TABLE = re.compile(
-    r"((?:MCP|PWS|AOC|FAN|CBL)-[\w-]+)\s*\|\s*(\d+|-)\s*\|\s*(.+)",
+    r"((?:MCP|PWS|AOC|FAN|CBL|SNK|RSC|BPN)-[\w-]+)\s*\|\s*(\d+|-)\s*\|\s*(.+)",
     re.IGNORECASE,
 )
 
@@ -67,7 +70,9 @@ _RE_COMPATIBLE_WITH = re.compile(
     r"Compatible\s+With\s*:\s*(.+)", re.IGNORECASE
 )
 
-_RE_FAMILY_TOKEN = re.compile(r"^(?:SC|CSE-?)?(\d{3}[A-Z]?)$", re.IGNORECASE)
+_RE_FAMILY_TOKEN = re.compile(
+    r"^(?:SC|CSE-?)?(\d{3}[A-Z]?|[A-Z]{1,2}\d{2,3}[A-Z]?)$", re.IGNORECASE
+)
 
 
 def _normalize(entity: str) -> str:
@@ -78,14 +83,25 @@ def _normalize(entity: str) -> str:
 def _chassis_to_family(chassis_model: str) -> Optional[str]:
     """Extract the chassis family prefix from a full chassis model number.
 
-    CSE-813MF2TS-R0RCNBP  →  SC813M
-    CSE-815TQ-R706WB      →  SC815
-    CSE-512F-600LB        →  SC512F
-    CSE-113MTQ-600CB      →  SC113M
+    Old style (digits first):
+      CSE-813MF2TS-R0RCNBP  →  SC813M
+      CSE-815TQ-R706WB      →  SC815
+      CSE-512F-600LB        →  SC512F
+      CSE-113MTQ-600CB      →  SC113M
+
+    New style (letters + digits):
+      CSE-LA26TS-R1K23AWP1  →  SCLA26T
+      CSE-LA15TQC-R504W     →  SCLA15T
+      CSE-LB26AC12-R1K23AW  →  SCLB26A
     """
     raw = chassis_model.upper().strip()
     raw = re.sub(r"^CSE-?", "", raw)
+    # Old style: starts with 3 digits + optional letter
     m = re.match(r"(\d{3}[A-Z]?)", raw)
+    if m:
+        return f"SC{m.group(1)}"
+    # New style: 1-2 letters + 2-3 digits + optional letter (e.g., LA26T, LB26A)
+    m = re.match(r"([A-Z]{1,2}\d{2,3}[A-Z]?)", raw)
     if m:
         return f"SC{m.group(1)}"
     return None
@@ -236,7 +252,10 @@ def _infer_chassis_from_filename(filename: str) -> Optional[str]:
 
 def _infer_accessory_from_text(text: str) -> Optional[str]:
     """Extract the primary accessory part number from chunk text."""
-    m = re.search(r"Part\s+Number\s*:\s*((?:MCP|PWS|AOC|FAN|CBL)-[\w-]+)", text, re.IGNORECASE)
+    m = re.search(
+        r"Part\s+Number\s*:\s*((?:MCP|PWS|AOC|FAN|CBL|SNK|RSC|BPN)-[\w-]+)",
+        text, re.IGNORECASE,
+    )
     if m:
         return _normalize(m.group(1))
     return None
@@ -272,12 +291,12 @@ def _parse_family_tokens(raw: str) -> List[str]:
 
 EXTRACTION_PROMPT = """Extract entity relationships from this Supermicro product documentation chunk.
 
-Entity types: system (SYS-*, AS-*, SSG-*), chassis (CSE-*), motherboard (X1*/H1*), 
-accessory (MCP-*, AOC-*, PWS-*, FAN-*, CBL-*), gpu, cpu_family, product_family, 
-cooling_type, software
+Entity types: system (SYS-*, AS-*, SSG-*), chassis (CSE-*), motherboard (X1*/H1*),
+accessory (MCP-*, AOC-*, PWS-*, FAN-*, CBL-*, SNK-*, RSC-*, BPN-*),
+gpu, cpu_family, chassis_family (SC* prefix), product_family
 
-Relationship types: uses_chassis, uses_motherboard, has_part, compatible_with, 
-supports_gpu, supports_cpu, belongs_to_family, belongs_to_generation, 
+Relationship types: uses_chassis, uses_motherboard, has_part, compatible_with,
+supports_gpu, supports_cpu, belongs_to_family, belongs_to_generation,
 requires, included_with, alternative_to
 
 Rules:
@@ -286,6 +305,11 @@ Rules:
 - For compatibility mentions like "designed for Twin series", use compatible_with.
 - For GPU support like "supports up to 8 NVIDIA H100", use supports_gpu with just the GPU name.
 - For CPU mentions like "AMD EPYC 9005 Series", use supports_cpu with "EPYC 9005".
+- For chassis family: when text mentions a chassis model (CSE-*), extract a belongs_to_family
+  relationship with the family prefix. Family prefix format: "SC" + the model's leading
+  identifier (e.g., CSE-813MF2TS → SC813M, CSE-LA26TS → SCLA26T, CSE-512F → SC512F).
+- For accessory compatibility: when text lists compatible chassis families or models,
+  extract compatible_with edges using the SC* family prefix.
 - Output an empty array [] if no relationships are found.
 
 Output ONLY a JSON array of triples (no other text):
