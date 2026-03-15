@@ -46,6 +46,58 @@ ENTITY_PATTERNS: Dict[str, re.Pattern] = {
 
 ACCESSORY_TYPES = {"accessory_mcp", "psu", "aoc", "fan", "cable", "heatsink", "riser", "backplane"}
 
+# ── Boilerplate detection ────────────────────────────────────────────────────
+# Supermicro product web pages embed a sidebar/navigation menu listing every
+# product family.  These phrases appear verbatim in 100+ chunks and cause the
+# LLM to create false entity relationships (e.g. attributing GPU/HPC support
+# to a mainstream 1U server).
+
+_NAV_BOILERPLATE_PHRASES = [
+    "broadest portfolio of single processor servers",
+    "extremely large in-memory computing",
+    "modular building block design, future proof",
+    "highest density gpu platforms for deployments",
+    "purpose-built liquid-cooled, hpc-at-scale",
+    "highest performing 2u twin architecture",
+    "multi-node architecture optimized for single processor",
+    "density maximized storage systems optimized",
+    "petascale all-flash array with nvidia grace",
+    "server-grade performance and ai inferencing at the edge",
+]
+
+_FOOTER_BOILERPLATE_PHRASES = [
+    "global leader in high performance",
+    "broad range of skus",
+]
+
+_HEADER_ONLY_PATTERN = re.compile(
+    r"^(Product SKUs|SuperServer|Motherboard|Processor|System Memory|"
+    r"On-Board Devices|Input / Output|System BIOS|Management|Security|"
+    r"PC Health Monitoring|Chassis|Dimensions and Weight|Front Panel|"
+    r"Expansion Slots|Drive Bays|System Cooling|Power Supply|"
+    r"Operating Environment|Publish Status)(\s*\n\s*)*",
+    re.MULTILINE,
+)
+
+
+def _is_boilerplate_chunk(text: str) -> bool:
+    """Return True if a chunk is mostly navigation boilerplate or empty headers."""
+    text_lower = text.lower()
+
+    nav_hits = sum(1 for phrase in _NAV_BOILERPLATE_PHRASES if phrase in text_lower)
+    if nav_hits >= 3:
+        return True
+
+    footer_hits = sum(1 for phrase in _FOOTER_BOILERPLATE_PHRASES if phrase in text_lower)
+    if footer_hits >= 2:
+        return True
+
+    stripped = _HEADER_ONLY_PATTERN.sub("", text).strip()
+    if len(stripped) < 30:
+        return True
+
+    return False
+
 # ── Regex-based relationship extraction ─────────────────────────────────────
 
 _RE_CHASSIS_LINE = re.compile(
@@ -56,7 +108,7 @@ _RE_MOBO_LINE = re.compile(
     re.IGNORECASE,
 )
 _RE_PARTS_TABLE = re.compile(
-    r"((?:MCP|PWS|AOC|FAN|CBL|SNK|RSC|BPN)-[\w-]+)\s*\|\s*(\d+|-)\s*\|\s*(.+)",
+    r"((?:MCP|PWS|AOC|FAN|CBL|SNK|RSC|BPN)-[\w-]+)\s*\|\s*(\d+\w*|-)\s*\|\s*(.+)",
     re.IGNORECASE,
 )
 
@@ -172,6 +224,7 @@ def _reverse_relation(rel: str) -> str:
         "uses_chassis": "used_by_system",
         "uses_motherboard": "used_by_system",
         "has_part": "part_of",
+        "has_standard_part": "standard_part_of",
         "supports_gpu": "supported_by",
         "supports_cpu": "supported_by",
         "compatible_with": "compatible_with",
@@ -180,6 +233,7 @@ def _reverse_relation(rel: str) -> str:
         "alternative_to": "alternative_to",
         "requires": "required_by",
         "included_with": "includes",
+        "validated_for": "validated_by",
     }
     return REVERSE_MAP.get(rel, f"reverse_{rel}")
 
@@ -285,6 +339,179 @@ def _parse_family_tokens(raw: str) -> List[str]:
         if fam_m:
             families.append(f"SC{fam_m.group(1).upper()}")
     return families
+
+
+# ── Chassis Family Registry ──────────────────────────────────────────────────
+
+def _build_family_registry(graph: EntityGraph) -> Dict[str, str]:
+    """Build a mapping from every known CSE-* chassis SKU to its SC* family.
+
+    Also covers system-to-family by following system → uses_chassis → chassis → family.
+    Returns dict like {"CSE-813MF2TS-R0RCNBP": "SC813M", "CSE-813MFTQC-505CB": "SC813M"}.
+    """
+    registry: Dict[str, str] = {}
+    for name, info in graph.entities.items():
+        if info["type"] == "chassis":
+            fam = _chassis_to_family(name)
+            if fam:
+                registry[name] = fam
+    return registry
+
+
+# ── Phase 0: Structured Import from estore_accessories.jsonl ────────────────
+
+_RE_SYSTEM_CODE = re.compile(
+    r"\b((?:SYS|AS|SSG|SBI)-[\w-]{4,})\b", re.IGNORECASE
+)
+_RE_CHASSIS_CODE = re.compile(
+    r"\b(CSE-[\w-]{4,})\b", re.IGNORECASE
+)
+
+
+def _import_structured_accessories(
+    graph: EntityGraph,
+    accessories_path: str,
+    family_registry: Dict[str, str],
+) -> int:
+    """Import edges from estore_accessories.jsonl structured fields.
+
+    Creates high-confidence edges from:
+      - compatible_chassis → accessory compatible_with chassis_family
+      - validated_systems  → accessory validated_for system
+      - validated_chassis  → accessory compatible_with chassis (+ family)
+    """
+    if not os.path.exists(accessories_path):
+        print(f"[EntityGraph] Phase 0: {accessories_path} not found, skipping")
+        return 0
+
+    edges_added = 0
+    with open(accessories_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            pn = rec.get("part_number", "").strip()
+            if not pn:
+                continue
+            pn = _normalize(pn)
+            graph.add_entity(pn, "accessory", "")
+
+            # compatible_chassis: family tokens like "SC813, SC514" or raw text
+            cc = rec.get("compatible_chassis", "").strip()
+            if cc:
+                families = _parse_family_tokens(cc)
+                for fam in families:
+                    graph.add_entity(fam, "chassis_family", "")
+                    graph.add_edge(pn, "compatible_with", fam)
+                    edges_added += 1
+
+                # Also parse any CSE-* codes in the raw text
+                for m in _RE_CHASSIS_CODE.finditer(cc):
+                    chassis = _normalize(m.group(1))
+                    graph.add_entity(chassis, "chassis", "")
+                    graph.add_edge(pn, "compatible_with", chassis)
+                    edges_added += 1
+                    fam = family_registry.get(chassis) or _chassis_to_family(chassis)
+                    if fam:
+                        graph.add_entity(fam, "chassis_family", "")
+                        graph.add_edge(pn, "compatible_with", fam)
+                        edges_added += 1
+
+            # validated_systems: comma-separated system codes
+            vs = rec.get("validated_systems", "").strip()
+            if vs:
+                for m in _RE_SYSTEM_CODE.finditer(vs):
+                    sys_code = _normalize(m.group(1))
+                    graph.add_entity(sys_code, "system", "")
+                    graph.add_edge(pn, "validated_for", sys_code)
+                    edges_added += 1
+
+            # validated_chassis: comma-separated chassis SKUs
+            vc = rec.get("validated_chassis", "").strip()
+            if vc:
+                for m in _RE_CHASSIS_CODE.finditer(vc):
+                    chassis = _normalize(m.group(1))
+                    graph.add_entity(chassis, "chassis", "")
+                    graph.add_edge(pn, "compatible_with", chassis)
+                    edges_added += 1
+                    fam = family_registry.get(chassis) or _chassis_to_family(chassis)
+                    if fam:
+                        graph.add_entity(fam, "chassis_family", "")
+                        graph.add_edge(pn, "compatible_with", fam)
+                        edges_added += 1
+
+    return edges_added
+
+
+# ── Phase 1c: BOM Enhancement with Family-Level Edges ───────────────────────
+
+def _enhance_bom_with_family_edges(
+    graph: EntityGraph,
+    family_registry: Dict[str, str],
+) -> int:
+    """Add has_standard_part edges from chassis families for every has_part edge.
+
+    When a BOM page lists: CSE-813MFTQC-505CB has_part MCP-290-00102-0N
+    This adds:          SC813M has_standard_part MCP-290-00102-0N
+
+    This ensures any system using ANY SC813M chassis variant can find the part.
+    """
+    edges_added = 0
+    family_parts: Dict[str, Set[str]] = defaultdict(set)
+
+    for edge in list(graph.edges):
+        if edge["relation"] != "has_part":
+            continue
+        parent = edge["source"]
+        part = edge["target"]
+        fam = family_registry.get(parent)
+        if fam and part not in family_parts[fam]:
+            family_parts[fam].add(part)
+            graph.add_entity(fam, "chassis_family", "")
+            graph.add_edge(fam, "has_standard_part", part, edge.get("chunk_id", ""))
+            edges_added += 1
+
+    return edges_added
+
+
+# ── Phase 3 helpers: Document classifier for LLM ────────────────────────────
+
+_MULTI_PRODUCT_PATTERNS = [
+    re.compile(r"CPU_Information", re.IGNORECASE),
+    re.compile(r"Mainstream_Servers", re.IGNORECASE),
+    re.compile(r"Product_SKUs", re.IGNORECASE),
+    re.compile(r"Compare_Products", re.IGNORECASE),
+    re.compile(r"_Servers_?_?\|", re.IGNORECASE),
+    re.compile(r"All_Systems", re.IGNORECASE),
+    re.compile(r"BIOS.*Firmware.*Download", re.IGNORECASE),
+]
+
+
+def _should_skip_llm(source_file: str, text: str) -> bool:
+    """Return True if this chunk should NOT be sent to the LLM for extraction.
+
+    Skips:
+    - Multi-product listing/comparison pages (noisy, many false edges)
+    - Chunks dominated by BOM/parts table rows (already handled by regex)
+    """
+    for pat in _MULTI_PRODUCT_PATTERNS:
+        if pat.search(source_file):
+            return True
+
+    bom_rows = len(_RE_PARTS_TABLE.findall(text))
+    non_bom_lines = len([
+        l for l in text.split("\n")
+        if l.strip() and not _RE_PARTS_TABLE.match(l.strip())
+    ])
+    if bom_rows >= 3 and non_bom_lines < bom_rows:
+        return True
+
+    return False
 
 
 # ── Phase 2: LLM-assisted extraction ───────────────────────────────────────
@@ -443,11 +670,22 @@ def build_graph(
     output_path: str,
     use_llm: bool = True,
     llm_provider: str = "anthropic",
+    accessories_path: str = None,
 ) -> dict:
-    """Build the entity graph from metadata.jsonl.
+    """Build the entity graph from metadata.jsonl and structured data sources.
+
+    Pipeline:
+      Phase 1:  Regex extraction from chunk text
+      Phase 1b: Chassis → family linkage
+      Phase 1c: Build family registry + BOM family-level edges
+      Phase 0:  Structured import from estore_accessories.jsonl
+      Phase 2:  LLM extraction (scoped, skips BOM/multi-product)
 
     Returns the adjacency-list dict (also saved to output_path).
     """
+    if accessories_path is None:
+        accessories_path = str(_repo_root / "data" / "accessories" / "estore_accessories.jsonl")
+
     print(f"[EntityGraph] Loading metadata from {metadata_path}")
     chunks = []
     with open(metadata_path) as f:
@@ -459,12 +697,18 @@ def build_graph(
 
     graph = EntityGraph()
 
-    # Phase 1: regex extraction
+    # Phase 1: regex extraction (skip boilerplate chunks)
     print("[EntityGraph] Phase 1: regex extraction ...")
     t0 = time.time()
+    boilerplate_skipped = 0
     for c in chunks:
-        extract_entities_regex(c["chunk_id"], c.get("text", ""), graph)
-    print(f"[EntityGraph]   {len(graph.entities)} entities, {len(graph.edges)} edges ({time.time()-t0:.1f}s)")
+        text = c.get("text", "")
+        if _is_boilerplate_chunk(text):
+            boilerplate_skipped += 1
+            continue
+        extract_entities_regex(c["chunk_id"], text, graph)
+    print(f"[EntityGraph]   {len(graph.entities)} entities, {len(graph.edges)} edges "
+          f"({boilerplate_skipped} boilerplate chunks skipped) ({time.time()-t0:.1f}s)")
 
     # Phase 1b: chassis → family edges
     print("[EntityGraph] Phase 1b: chassis family linkage ...")
@@ -478,16 +722,38 @@ def build_graph(
                 family_count += 1
     print(f"[EntityGraph]   {family_count} chassis→family edges added")
 
-    # Phase 2: LLM extraction
+    # Phase 1c: build family registry and enhance BOM edges
+    print("[EntityGraph] Phase 1c: family registry + BOM enhancement ...")
+    family_registry = _build_family_registry(graph)
+    print(f"[EntityGraph]   Family registry: {len(family_registry)} chassis→family mappings")
+    bom_edges = _enhance_bom_with_family_edges(graph, family_registry)
+    print(f"[EntityGraph]   +{bom_edges} has_standard_part edges (family-level BOM)")
+
+    # Phase 0: structured import from estore_accessories.jsonl
+    print(f"[EntityGraph] Phase 0: structured import from {accessories_path} ...")
+    t_acc = time.time()
+    acc_edges = _import_structured_accessories(graph, accessories_path, family_registry)
+    print(f"[EntityGraph]   +{acc_edges} edges from structured accessories ({time.time()-t_acc:.1f}s)")
+
+    # Phase 2: LLM extraction (scoped — skip BOM chunks and multi-product docs)
     if use_llm:
-        print("[EntityGraph] Phase 2: LLM-assisted extraction ...")
+        print("[EntityGraph] Phase 2: LLM-assisted extraction (scoped) ...")
         t1 = time.time()
-        # Only send chunks that contain meaningful product text (skip page separators, boilerplate)
         meaningful = [
             c for c in chunks
             if len(c.get("text", "")) > 80
             and not c.get("text", "").strip().startswith("--- Page")
+            and not _is_boilerplate_chunk(c.get("text", ""))
+            and not _should_skip_llm(c.get("source_file", ""), c.get("text", ""))
         ]
+        skipped_by_classifier = sum(
+            1 for c in chunks
+            if len(c.get("text", "")) > 80
+            and not c.get("text", "").strip().startswith("--- Page")
+            and not _is_boilerplate_chunk(c.get("text", ""))
+            and _should_skip_llm(c.get("source_file", ""), c.get("text", ""))
+        )
+        print(f"[EntityGraph]   {len(meaningful)} chunks for LLM ({skipped_by_classifier} skipped by classifier)")
         n_added = extract_relationships_llm(meaningful, graph, provider=llm_provider)
         print(f"[EntityGraph]   +{n_added} LLM triples ({time.time()-t1:.1f}s)")
 
@@ -524,10 +790,19 @@ def main():
         "--provider", default=None,
         help="LLM provider for extraction (default: from .env LLM_PROVIDER or anthropic)",
     )
+    parser.add_argument(
+        "--accessories", default=None,
+        help="Path to estore_accessories.jsonl (default: data/accessories/estore_accessories.jsonl)",
+    )
     args = parser.parse_args()
 
     provider = args.provider or os.getenv("LLM_PROVIDER", "anthropic")
-    build_graph(args.metadata, args.output, use_llm=not args.no_llm, llm_provider=provider)
+    build_graph(
+        args.metadata, args.output,
+        use_llm=not args.no_llm,
+        llm_provider=provider,
+        accessories_path=args.accessories,
+    )
 
 
 if __name__ == "__main__":

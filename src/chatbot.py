@@ -47,6 +47,7 @@ SYSTEM_MESSAGE = """You are a technical assistant specializing in Supermicro ser
 - For product questions include: form factor, CPU, GPU (if any), memory, storage, networking, use cases.
 - When listing a product family, include ALL generations found in context, not just the latest.
 - Synthesize information across multiple sources into one coherent answer.
+- If no product matches ALL requested criteria, present the closest match(es) and clearly note which criteria they meet and which they don't. Never just say "no match found" when close alternatives exist.
 
 ## STRICT RULES
 1. Never fabricate specific hardware numbers (DIMM slot counts, drive bays, GPU counts, PSU wattage, clock speeds, etc.). If a spec isn't in the provided documents, omit it rather than guessing.
@@ -57,6 +58,7 @@ SYSTEM_MESSAGE = """You are a technical assistant specializing in Supermicro ser
 6. Minimize "I don't have" statements. If you have partial info, lead with what you know. Only mention a gap if the user specifically asked for that detail.
 7. Do not over-hedge ("I can't confirm without...", "treat as TBD"). Be direct.
 8. Do not reference unrelated products from conversation history.
+9. **Pricing**: Prices in the context are approximate and may not reflect current eStore pricing. When mentioning a price, always note it is approximate (e.g. "starting at approximately $X,XXX") and direct the user to the Supermicro eStore for current pricing.
 
 ## TONE
 - Never say "based on the retrieved context", "according to my database", "the retrieved documents show", or similar phrases that expose the system internals. Just state the information directly and confidently.
@@ -345,26 +347,64 @@ class SupermicroChatbot:
         print("[EntityGraph] No entity_graph.json found — graph expansion disabled")
         return {}
 
+    _GRAPH_TRAVERSAL_RELATIONS = frozenset({
+        "uses_chassis", "used_by_system",
+        "uses_motherboard", "used_by_system",
+        "has_part", "part_of",
+        "has_standard_part", "standard_part_of",
+        "compatible_with",
+        "belongs_to_family", "has_member",
+        "requires", "required_by",
+        "included_with", "includes",
+        "validated_for", "validated_by",
+    })
+
+    _ACCESSORY_TYPE_KEYWORDS = {
+        "rail": "MCP-290",
+        "rail kit": "MCP-290",
+        "bezel": "MCP-210",
+        "io shield": "MCP-260",
+        "i/o shield": "MCP-260",
+        "bracket": "MCP-230",
+        "add-on card": "AOC-",
+        "riser": "RSC-",
+        "backplane": "BPN-",
+        "power supply": "PWS-",
+        "psu": "PWS-",
+        "fan": "FAN-",
+        "cable": "CBL-",
+        "heatsink": "SNK-",
+    }
+
     def _expand_via_graph(
         self,
         query_entities: List[str],
         existing_chunks: list,
         max_hops: int = 2,
         max_extra_chunks: int = 6,
+        query_text: str = "",
     ) -> list:
         """Follow entity-graph edges to pull in related chunks not yet retrieved.
+
+        Uses a family-aware BFS: system -> chassis -> chassis_family -> parts.
+        When query_text mentions a specific accessory type (e.g. "rail kit"),
+        entities matching that type are prioritized.
 
         Returns additional chunks (does NOT include the existing ones).
         """
         if not self.entity_graph or not query_entities:
             return []
 
-        # Collect all chunk source files already retrieved
-        existing_sources: Set[str] = set()
-        for c in existing_chunks:
-            existing_sources.add(c.get("source_file", "").upper())
+        # Detect accessory type hint from query text
+        type_prefix = None
+        if query_text:
+            q_lower = query_text.lower()
+            for kw, prefix in self._ACCESSORY_TYPE_KEYWORDS.items():
+                if kw in q_lower:
+                    type_prefix = prefix
+                    break
 
-        # BFS up to max_hops
+        # BFS up to max_hops (only following structural edges)
         visited: Set[str] = set()
         frontier: Set[str] = set()
         for entity in query_entities:
@@ -382,6 +422,9 @@ class SupermicroChatbot:
                 visited.add(node)
                 node_data = self.entity_graph.get(node, {})
                 for edge in node_data.get("edges", []):
+                    relation = edge.get("relation", "")
+                    if relation not in self._GRAPH_TRAVERSAL_RELATIONS:
+                        continue
                     target = edge["target"]
                     if target not in visited:
                         next_frontier.add(target)
@@ -393,16 +436,68 @@ class SupermicroChatbot:
 
         print(f"[EntityGraph] Graph expansion: {query_entities} → {len(related_entities)} related entities")
 
-        # Prioritize accessory entities (MCP-, PWS-, AOC-, FAN-, CBL-) over
-        # generic entities like CPU families to keep results relevant
-        _accessory_prefix = re.compile(r"^(MCP|PWS|AOC|FAN|CBL)-", re.IGNORECASE)
-        accessories_first = sorted(
-            related_entities,
-            key=lambda e: (0 if _accessory_prefix.match(e) else 1),
-        )
-
         extra_chunks = []
         seen_ids = {c.get("chunk_id") for c in existing_chunks}
+
+        # Step 1: Fetch chassis BOM pages using the chassis family prefix.
+        # A single BOM chunk lists ALL standard parts for a chassis family,
+        # so it's far more efficient than fetching individual part pages.
+        seen_families: Set[str] = set()
+        for entity in query_entities:
+            key = entity.upper()
+            node_data = self.entity_graph.get(key, {})
+            for edge in node_data.get("edges", []):
+                if edge.get("relation") == "uses_chassis":
+                    chassis = edge["target"]
+                    chassis_node = self.entity_graph.get(chassis, {})
+                    for ce in chassis_node.get("edges", []):
+                        if ce.get("relation") == "belongs_to_family":
+                            family = ce["target"]
+                            if family not in seen_families:
+                                seen_families.add(family)
+                                prefix = family.replace("SC", "CSE-")
+                                if type_prefix:
+                                    query_str = f"{type_prefix} standard parts list"
+                                else:
+                                    query_str = "standard parts list optional parts"
+                                retrieved = self.query_processor.retrieve(
+                                    query_str, top_k=8, max_per_source=3,
+                                    source_filter=prefix)
+                                added = 0
+                                for rc in retrieved:
+                                    cid = rc.get("chunk_id")
+                                    if cid not in seen_ids and added < 4:
+                                        seen_ids.add(cid)
+                                        rc["_graph_expanded"] = True
+                                        rc["_bom_chunk"] = True
+                                        extra_chunks.append(rc)
+                                        added += 1
+                                if added:
+                                    print(f"[EntityGraph]   +{added} BOM chunks for family '{family}' (query: '{query_str}')")
+
+        # Step 2: Backfill with individual accessory pages, prioritizing
+        # by query-relevant type (e.g., MCP-290 for "rail kit" queries).
+        def _accessory_sort_key(entity: str) -> int:
+            e = entity.upper()
+            if type_prefix and e.startswith(type_prefix.upper()):
+                return -1
+            if e.startswith("MCP-"):
+                return 0
+            if e.startswith(("AOC-", "RSC-", "BPN-")):
+                return 1
+            if e.startswith(("PWS-", "FAN-", "CBL-", "SNK-")):
+                return 2
+            if e.startswith("CSE-"):
+                return 3
+            return 4
+
+        bom_found = any(c.get("_bom_chunk") for c in extra_chunks)
+        if bom_found and type_prefix:
+            accessories_first = sorted(
+                [e for e in related_entities if e.upper().startswith(type_prefix.upper())],
+                key=_accessory_sort_key)
+        else:
+            accessories_first = sorted(related_entities, key=_accessory_sort_key)
 
         for entity in accessories_first:
             if len(extra_chunks) >= max_extra_chunks:
@@ -415,8 +510,7 @@ class SupermicroChatbot:
             if already_have:
                 continue
 
-            # Skip family nodes themselves -- they're structural, not content-bearing
-            if node_data.get("type") == "chassis_family":
+            if node_data.get("type") in ("chassis_family", "chassis"):
                 continue
 
             retrieved = self.query_processor.retrieve(entity, top_k=3, max_per_source=2)
@@ -599,8 +693,7 @@ class SupermicroChatbot:
             rag_top_k = 5
             catalog_max = 0
             catalog_results = []
-            source_filter = "FAQ:"
-            print(f"[DEBUG] Plan: faq → RAG only: top {rag_top_k}, source_filter='{source_filter}' (no catalog, no graph)")
+            print(f"[DEBUG] Plan: faq → FAQ question bank: top {rag_top_k} (no catalog, no graph)")
         else:
             rag_top_k = self.top_k
             catalog_max = 0
@@ -621,7 +714,46 @@ class SupermicroChatbot:
 
         rag_query = search_queries[0] if search_queries else retrieval_query
 
-        if len(search_queries) >= 2 and plan.use_rag:
+        # FAQ intent: combine question bank + source-filtered hybrid search
+        if plan.intent == "faq":
+            # Pass 1: question-to-question matching (precise title similarity)
+            qbank_chunks = self.query_processor.retrieve_faq(retrieval_query, rag_top_k)
+
+            # Pass 2: source-filtered hybrid search (BM25 keyword coverage)
+            hybrid_chunks = self.query_processor.retrieve(
+                rag_query, rag_top_k, source_filter="FAQ:")
+
+            # Merge: question bank first, then backfill from hybrid
+            chunks = list(qbank_chunks)
+            seen_ids = {c.get("chunk_id") for c in chunks}
+            hybrid_added = 0
+            for hc in hybrid_chunks:
+                if hc.get("chunk_id") not in seen_ids:
+                    seen_ids.add(hc.get("chunk_id"))
+                    chunks.append(hc)
+                    hybrid_added += 1
+            if hybrid_added:
+                print(f"[DEBUG] FAQ merged: {len(qbank_chunks)} qbank + {hybrid_added} hybrid backfill")
+            faq_combined_limit = rag_top_k + min(hybrid_added, rag_top_k)
+            chunks = chunks[:faq_combined_limit]
+
+            # Supplement with a couple of general-corpus chunks for context
+            if chunks:
+                faq_count = len(chunks)
+                supplement_slots = 2
+                seen_ids = {c.get("chunk_id") for c in chunks}
+                supplement = self.query_processor.retrieve(retrieval_query, 5, max_per_source=1)
+                added = 0
+                for sc in supplement:
+                    if sc.get("chunk_id") not in seen_ids and "FAQ:" not in sc.get("source_file", ""):
+                        chunks.append(sc)
+                        added += 1
+                        if added >= supplement_slots:
+                            break
+                if added:
+                    print(f"[DEBUG] FAQ supplement: {faq_count} FAQ + {added} general context chunks")
+
+        elif len(search_queries) >= 2 and plan.use_rag:
             per_k = max(5, rag_top_k // len(search_queries))
             rag_top_k = max(rag_top_k, len(search_queries) * per_k)
             per_query_chunks = {}
@@ -650,22 +782,6 @@ class SupermicroChatbot:
         else:
             chunks = self.query_processor.retrieve(rag_query, rag_top_k, max_per_source=max_per_source,
                                                    source_filter=source_filter) if plan.use_rag else []
-
-        # Two-pass FAQ retrieval: primary FAQ-only chunks + supplementary general context
-        if source_filter and chunks:
-            faq_count = len(chunks)
-            supplement_slots = 2
-            seen_ids = {c.get("chunk_id") for c in chunks}
-            supplement = self.query_processor.retrieve(rag_query, 5, max_per_source=1)
-            added = 0
-            for sc in supplement:
-                if sc.get("chunk_id") not in seen_ids and source_filter not in sc.get("source_file", ""):
-                    chunks.append(sc)
-                    added += 1
-                    if added >= supplement_slots:
-                        break
-            if added:
-                print(f"[DEBUG] FAQ supplement: {faq_count} FAQ + {added} general context chunks")
 
         if chunks and plan.product_codes and plan.use_rag:
             chunk_sources = " ".join(c.get("source_file", "") for c in chunks).upper()
@@ -713,7 +829,8 @@ class SupermicroChatbot:
         if self.entity_graph and plan.accessory_query and plan.product_codes:
             graph_chunks = self._expand_via_graph(
                 plan.product_codes, chunks,
-                max_hops=3, max_extra_chunks=6,
+                max_hops=3, max_extra_chunks=10,
+                query_text=question,
             )
         elif self.entity_graph and plan.product_codes:
             _accessory_kw = re.compile(
@@ -723,7 +840,8 @@ class SupermicroChatbot:
             if _accessory_kw.search(question):
                 graph_chunks = self._expand_via_graph(
                     plan.product_codes, chunks,
-                    max_hops=3, max_extra_chunks=6,
+                    max_hops=3, max_extra_chunks=10,
+                    query_text=question,
                 )
 
         # --- Build combined context ---
@@ -739,8 +857,19 @@ class SupermicroChatbot:
             else:
                 context_parts.append(rag_context)
         if graph_chunks:
-            graph_context = self.query_processor.format_context(graph_chunks)
-            context_parts.append(f"RELATED PRODUCT DATA (from linked documents):\n{graph_context}")
+            bom_chunks = [c for c in graph_chunks if c.get("_bom_chunk")]
+            other_graph = [c for c in graph_chunks if not c.get("_bom_chunk")]
+            if bom_chunks:
+                bom_context = self.query_processor.format_context(bom_chunks)
+                chassis_label = ""
+                if plan.product_codes:
+                    chassis_label = f" for {plan.product_codes[0]}'s chassis family"
+                context_parts.append(
+                    f"CHASSIS STANDARD & OPTIONAL PARTS LIST{chassis_label} "
+                    f"(these are the specific parts/accessories/rail kits for this system):\n{bom_context}")
+            if other_graph:
+                other_context = self.query_processor.format_context(other_graph)
+                context_parts.append(f"RELATED PRODUCT DATA (from linked documents):\n{other_context}")
 
         sources_from_catalog = catalog_results[:catalog_max] if catalog_max > 0 else []
         seen = set()

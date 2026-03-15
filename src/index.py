@@ -80,6 +80,7 @@ class HybridIndex:
         self._load_metadata()
         self._build_filename_index()
         self._load_model()
+        self._build_faq_question_bank()
     
     def _load_faiss_index(self):
         """Load FAISS index from disk."""
@@ -132,7 +133,87 @@ class HybridIndex:
         """Load sentence transformer model."""
         print(f"Loading embedding model: {self.model_name}...")
         self.model = SentenceTransformer(self.model_name)
-    
+
+    def _build_faq_question_bank(self):
+        """Build a lightweight vector bank of FAQ question titles for direct
+        user-question → FAQ-question matching.
+
+        Scans metadata for FAQ chunks, extracts the question text from each
+        chunk, deduplicates, embeds the unique questions, and stores them
+        alongside a mapping from question index → chunk indices.
+        """
+        faq_questions: Dict[str, List[int]] = {}
+
+        for idx, meta in enumerate(self.metadata):
+            source = meta.get('source_file', '')
+            if 'FAQ:' not in source:
+                continue
+
+            text = meta.get('text', '')
+            match = re.search(r'Q:\s*(.+?)(?:\n|$)', text)
+            if match:
+                question = match.group(1).strip()
+            else:
+                q = source.replace('web_page_', '').replace('.txt', '')
+                q = re.sub(r'^FAQ:_?', '', q).replace('_', ' ').strip()
+                if not q:
+                    continue
+                question = q
+
+            if question not in faq_questions:
+                faq_questions[question] = []
+            faq_questions[question].append(idx)
+
+        if not faq_questions:
+            self._faq_questions: List[str] = []
+            self._faq_embeddings: Optional[np.ndarray] = None
+            self._faq_chunk_map: Dict[int, List[int]] = {}
+            print("[FAQ Bank] No FAQ entries found in metadata")
+            return
+
+        self._faq_questions = list(faq_questions.keys())
+        self._faq_chunk_map = {i: faq_questions[q]
+                               for i, q in enumerate(self._faq_questions)}
+
+        embeddings = self.model.encode(self._faq_questions)
+        embeddings = embeddings.astype('float32')
+        faiss.normalize_L2(embeddings)
+        self._faq_embeddings = embeddings
+
+        total_chunks = sum(len(v) for v in self._faq_chunk_map.values())
+        print(f"[FAQ Bank] Built question bank: {len(self._faq_questions)} questions, "
+              f"{total_chunks} chunks")
+
+    def search_faq_questions(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> List[Tuple[int, str, float, List[int]]]:
+        """Match a user query against FAQ question titles via cosine similarity.
+
+        Returns:
+            List of (question_index, question_text, score, chunk_indices) tuples,
+            sorted by descending similarity.
+        """
+        if self._faq_embeddings is None or not self._faq_questions:
+            return []
+
+        query_emb = self.model.encode([query]).astype('float32')
+        faiss.normalize_L2(query_emb)
+
+        scores = np.dot(self._faq_embeddings, query_emb.T).flatten()
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        results = []
+        for qi in top_indices:
+            results.append((
+                int(qi),
+                self._faq_questions[qi],
+                float(scores[qi]),
+                self._faq_chunk_map[int(qi)],
+            ))
+        return results
+
     def search_semantic(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
         """
         Semantic search using FAISS.

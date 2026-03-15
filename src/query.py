@@ -177,6 +177,47 @@ class RAGQueryProcessor:
         self.index = HybridIndex(index_dir, model_name)
         self.enable_reranking = enable_reranking and (os.getenv("ENABLE_RERANKING", "1") != "0")
     
+    def retrieve_faq(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> List[Dict]:
+        """Retrieve FAQ chunks using question-to-question matching.
+
+        Matches the user query against FAQ question titles (cosine similarity),
+        then returns the full content chunks for the top matching FAQs.
+        Falls back to source-filtered hybrid search if no question bank exists.
+        """
+        faq_matches = self.index.search_faq_questions(query, top_k)
+
+        if not faq_matches:
+            print("[DEBUG] FAQ question bank empty, falling back to source_filter retrieval")
+            return self.retrieve(query, top_k, source_filter="FAQ:")
+
+        chunks = []
+        seen_ids: set = set()
+        for _qi, question, score, chunk_indices in faq_matches:
+            for idx in chunk_indices:
+                if idx < len(self.index.metadata):
+                    meta = self.index.metadata[idx]
+                    cid = meta.get('chunk_id', f'faq_{idx}')
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        chunks.append({
+                            "text": meta["text"],
+                            "source_file": meta["source_file"],
+                            "chunk_id": cid,
+                            "similarity_score": score,
+                            "faq_question": question,
+                        })
+
+        print(f"[DEBUG] FAQ question bank: {len(faq_matches)} questions matched, "
+              f"{len(chunks)} chunks")
+        for _qi, question, score, _ in faq_matches[:3]:
+            print(f"[DEBUG]   {score:.4f} '{question[:80]}'")
+
+        return chunks[:top_k]
+
     def retrieve(
         self, 
         query: str, 
