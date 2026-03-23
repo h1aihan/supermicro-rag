@@ -53,6 +53,24 @@ EXCLUDE_PATTERNS = [
     r'_compliance',
 ]
 
+# Chassis documentation patterns
+CHASSIS_PATTERNS = [
+    r'^SC\d',           # SC813, SC946, SC417, etc.
+    r'^CSE-',           # CSE-M14TQC, CSE-SAS-813TQ, etc.
+    r'^MNL-SC',         # MNL-SC837J (chassis manuals by MNL code)
+    r'^MNL-\d+.*SC',    # MNL-1813 style chassis manuals
+    r'^QRG-\d+',        # QRG-1813 style quick reference guides
+]
+
+# Motherboard/system manual patterns
+MANUAL_PATTERNS = [
+    r'^MNL-',           # MNL-1311-QRG-X9SCM, MNL-X10DRFF, etc.
+    r'^IPMI.*[Uu]ser',  # IPMI user guides
+    r'^BMC_IPMI',       # BMC/IPMI documentation
+    r'_User[_s]?_?Guide',
+    r'^BPN-',           # Backplane documentation
+]
+
 
 def is_datasheet(filename: str) -> bool:
     """
@@ -64,13 +82,27 @@ def is_datasheet(filename: str) -> bool:
     Returns:
         True if the file appears to be a product datasheet
     """
-    # First check exclusions
     for pattern in EXCLUDE_PATTERNS:
         if re.search(pattern, filename, re.IGNORECASE):
             return False
     
-    # Then check if it matches datasheet patterns
     for pattern in DATASHEET_PATTERNS:
+        if re.search(pattern, filename, re.IGNORECASE):
+            return True
+    return False
+
+
+def is_chassis_doc(filename: str) -> bool:
+    """Check if a filename matches chassis documentation patterns."""
+    for pattern in CHASSIS_PATTERNS:
+        if re.search(pattern, filename, re.IGNORECASE):
+            return True
+    return False
+
+
+def is_manual(filename: str) -> bool:
+    """Check if a filename matches motherboard/system manual patterns."""
+    for pattern in MANUAL_PATTERNS:
         if re.search(pattern, filename, re.IGNORECASE):
             return True
     return False
@@ -82,7 +114,10 @@ def filter_pdfs(pdf_files: List[Path], filter_type: Optional[str] = None) -> Lis
     
     Args:
         pdf_files: List of PDF file paths
-        filter_type: Type of filter to apply ('datasheet', 'all', or None)
+        filter_type: Type of filter to apply:
+            'datasheet' - datasheets only (original behaviour)
+            'product'   - datasheets + chassis docs + manuals
+            'all'/None  - everything
         
     Returns:
         Filtered list of PDF files
@@ -94,8 +129,24 @@ def filter_pdfs(pdf_files: List[Path], filter_type: Optional[str] = None) -> Lis
         filtered = [f for f in pdf_files if is_datasheet(f.name)]
         print(f"Filtered to {len(filtered)} datasheets (from {len(pdf_files)} total PDFs)")
         return filtered
+
+    if filter_type == 'product':
+        datasheets, chassis, manuals, other = [], [], [], []
+        for f in pdf_files:
+            if is_datasheet(f.name):
+                datasheets.append(f)
+            elif is_chassis_doc(f.name):
+                chassis.append(f)
+            elif is_manual(f.name):
+                manuals.append(f)
+        filtered = datasheets + chassis + manuals
+        print(f"Filtered to {len(filtered)} product docs (from {len(pdf_files)} total PDFs)")
+        print(f"  Datasheets: {len(datasheets)}")
+        print(f"  Chassis docs: {len(chassis)}")
+        print(f"  Manuals: {len(manuals)}")
+        print(f"  Skipped: {len(pdf_files) - len(filtered)}")
+        return filtered
     
-    # Unknown filter type - return all
     print(f"Warning: Unknown filter type '{filter_type}', processing all PDFs")
     return pdf_files
 
@@ -301,9 +352,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--filter",
-        choices=['datasheet', 'all'],
+        choices=['datasheet', 'product', 'all'],
         default='all',
-        help="Filter PDFs by type: 'datasheet' for datasheets only, 'all' for everything (default: all)"
+        help="Filter PDFs: 'datasheet' (specs only), 'product' (datasheets + chassis + manuals), 'all' (default)"
     )
     
     args = parser.parse_args()

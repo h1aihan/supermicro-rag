@@ -53,12 +53,13 @@ SYSTEM_MESSAGE = """You are a technical assistant specializing in Supermicro ser
 1. Never fabricate specific hardware numbers (DIMM slot counts, drive bays, GPU counts, PSU wattage, clock speeds, etc.). If a spec isn't in the provided documents, omit it rather than guessing.
 2. Never invent specific part numbers (AOC cards, NIC models, cable SKUs) unless they appear in the provided documents.
 3. You MAY supplement with general domain knowledge to provide context, explain concepts, or describe typical use cases — just don't fabricate specific specs or part numbers.
-4. Do not speculate about WHY information is missing (e.g. "the datasheet wasn't fully extracted"). Just present what you have.
-5. Do not list things you "need" or "would need" — focus on what you CAN answer.
-6. Minimize "I don't have" statements. If you have partial info, lead with what you know. Only mention a gap if the user specifically asked for that detail.
-7. Do not over-hedge ("I can't confirm without...", "treat as TBD"). Be direct.
-8. Do not reference unrelated products from conversation history.
-9. **Pricing**: Prices in the context are approximate and may not reflect current eStore pricing. When mentioning a price, always note it is approximate (e.g. "starting at approximately $X,XXX") and direct the user to the Supermicro eStore for current pricing.
+4. For CPU/hardware compatibility: only state what the documentation says is supported. If a CPU is not listed, say it is not listed as supported — do NOT invent a technical reason (wrong series, wrong socket, wrong generation) unless the documents explicitly state it.
+5. Do not speculate about WHY information is missing (e.g. "the datasheet wasn't fully extracted"). Just present what you have.
+6. Do not list things you "need" or "would need" — focus on what you CAN answer.
+7. Minimize "I don't have" statements. If you have partial info, lead with what you know. Only mention a gap if the user specifically asked for that detail.
+8. Do not over-hedge ("I can't confirm without...", "treat as TBD"). Be direct.
+9. Do not reference unrelated products from conversation history.
+10. **Pricing**: Prices in the context are approximate and may not reflect current eStore pricing. When mentioning a price, always note it is approximate (e.g. "starting at approximately $X,XXX") and direct the user to the Supermicro eStore for current pricing.
 
 ## TONE
 - Never say "based on the retrieved context", "according to my database", "the retrieved documents show", or similar phrases that expose the system internals. Just state the information directly and confidently.
@@ -67,6 +68,21 @@ SYSTEM_MESSAGE = """You are a technical assistant specializing in Supermicro ser
 - Do NOT list sources or filenames in your response. The UI displays sources separately.
 
 ## DOMAIN KNOWLEDGE
+
+### Platform Generation → CPU Compatibility
+Supermicro uses platform codes (H12/H13/H14 for AMD, X12/X13/X14 for Intel) that determine which CPU generations a server supports. IMPORTANT: many products support MULTIPLE CPU generations within the same platform family.
+
+AMD platforms:
+- H12 → EPYC 7003 (Milan)
+- H13 → EPYC 9004 (Genoa/Bergamo). Many H13 products also support EPYC 9005 (Turin) via BIOS/firmware updates.
+- H14 → EPYC 9005 (Turin). Many H14 products also support EPYC 9004.
+
+Intel platforms:
+- X12 → 3rd Gen Xeon Scalable (Ice Lake)
+- X13 → 4th/5th Gen Xeon Scalable (Sapphire/Emerald Rapids)
+- X14 → Intel Xeon 6 (Granite Rapids / Sierra Forest)
+
+CRITICAL: If a product's data only lists one CPU generation (e.g. "EPYC 9004") but the product name or context suggests it's an H13/H14 platform, it likely also supports the adjacent generation. Do NOT claim a product "only supports 9004" or "does not support 9005" unless the documentation explicitly states that limitation. Instead, list what's confirmed and note that the user should check supermicro.com for the latest CPU compatibility.
 
 ### NVIDIA GPU → Supermicro System Mapping
 GPU names (H100, H200, B200) are NVIDIA's names, not Supermicro's. Datasheets use Supermicro model numbers. When context contains these systems and the user asks about the GPU, present them as the answer:
@@ -85,7 +101,8 @@ When answering eStore FAQ questions (ordering, shipping, returns, payments, acco
 - Use a helpful customer-service tone rather than technical spec presentation.
 - Do not use markdown tables — plain text or short bullet lists are preferred.
 - If the FAQ provides a specific process (step-by-step), present it clearly.
-- If the user's question isn't covered by the FAQ context, suggest contacting Supermicro support via live chat or email."""
+- If the user's question isn't covered by the FAQ context, suggest contacting Supermicro support via live chat or email.
+- **Urgency / delivery timeline questions**: When a customer asks about getting a server quickly, by a deadline, or overnight, focus on AVAILABLE SHIPPING OPTIONS (overnight, priority overnight, expedited) from the FAQ context rather than quoting production lead times. Present what IS available as the answer and direct them to contact support for specifics. Do NOT answer "no" or "unfortunately" when overnight shipping exists as an option."""
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +320,8 @@ class SupermicroChatbot:
     
     def __init__(
         self,
-        index_dir: str = "embeddings/faiss_index/",
+        index_dir: str = "embeddings/primary_index/",
+        manual_dir: str = "embeddings/manual_index/",
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         llm_model: str = "gpt-3.5-turbo",
         llm_provider: str = "openai",
@@ -315,7 +333,8 @@ class SupermicroChatbot:
         Initialize the chatbot.
         
         Args:
-            index_dir: Directory containing FAISS index
+            index_dir: Directory containing primary FAISS index
+            manual_dir: Directory containing manual FAISS index (user guides, etc.)
             embedding_model: Sentence transformer model name
             llm_model: LLM model name
             llm_provider: LLM provider (openai, ollama)
@@ -323,18 +342,30 @@ class SupermicroChatbot:
             temperature: LLM sampling temperature (0.0 = deterministic, 1.0 = creative)
             top_p: LLM nucleus sampling threshold (1.0 = no filtering)
         """
-        self.query_processor = RAGQueryProcessor(index_dir, embedding_model)
+        self.query_processor = RAGQueryProcessor(index_dir, embedding_model,
+                                                 manual_dir=manual_dir)
         self.llm_model = llm_model
         self.llm_provider = llm_provider
         self.top_k = top_k
         self.temperature = temperature
         self.top_p = top_p
 
+        self._PRODUCT_INTENTS = frozenset({"detail", "list", "compare", "follow_up"})
+
         # Structured product catalog for listing/enumeration queries
         self.catalog = ProductCatalog()
 
+        # PDF filename → direct Supermicro download URL (from crawler)
+        self._pdf_url_map = self._load_pdf_url_map()
+
         # Entity-relationship graph for multi-hop retrieval
         self.entity_graph = self._load_entity_graph(index_dir)
+
+    def _effective_temperature(self, intent: str) -> float:
+        """Product intents use 0.3; FAQ/general use low temperature to reduce hallucination."""
+        if intent in self._PRODUCT_INTENTS:
+            return 0.3
+        return min(self.temperature, 0.1)
     
     @staticmethod
     def _load_entity_graph(index_dir: str) -> Dict:
@@ -543,14 +574,19 @@ class SupermicroChatbot:
                 "max_per_source": ctx["max_per_source"],
             }
 
+        _temp = self._effective_temperature(ctx["plan"].intent)
         answer = get_llm_response(
             ctx["prompt"], self.llm_model, self.llm_provider,
-            self.temperature, self.top_p,
+            _temp, self.top_p,
         )
+        links_block = self._format_links_block(ctx.get("doc_links", {}))
+        if links_block:
+            answer += links_block
 
         return {
             "answer": answer,
             "sources": ctx["sources"],
+            "doc_links": ctx.get("doc_links", {}),
             "chunks": ctx["chunks"],
             "plan": ctx["plan"],
             "search_queries": ctx["search_queries"],
@@ -759,7 +795,8 @@ class SupermicroChatbot:
             per_query_chunks = {}
             with ThreadPoolExecutor(max_workers=len(search_queries)) as pool:
                 futures = {sq: pool.submit(self.query_processor.retrieve, sq, per_k,
-                                           source_filter=source_filter) for sq in search_queries}
+                                           source_filter=source_filter,
+                                           scope=plan.search_scope) for sq in search_queries}
                 for sq, fut in futures.items():
                     per_query_chunks[sq] = fut.result()
                     print(f"[DEBUG]   '{sq[:60]}' → {len(per_query_chunks[sq])} chunks")
@@ -781,7 +818,8 @@ class SupermicroChatbot:
             print(f"[DEBUG] Split retrieval: {len(search_queries)} queries, {len(chunks)} chunks (balanced)")
         else:
             chunks = self.query_processor.retrieve(rag_query, rag_top_k, max_per_source=max_per_source,
-                                                   source_filter=source_filter) if plan.use_rag else []
+                                                   source_filter=source_filter,
+                                                   scope=plan.search_scope) if plan.use_rag else []
 
         if chunks and plan.product_codes and plan.use_rag:
             chunk_sources = " ".join(c.get("source_file", "") for c in chunks).upper()
@@ -888,6 +926,14 @@ class SupermicroChatbot:
                 seen.add(src)
                 sources.append(src)
 
+        # Only attach a document link when the user is asking for a manual
+        if plan.doc_type_hint == "manual":
+            doc_links = self._build_doc_links(
+                sources, chunks + graph_chunks, sources_from_catalog,
+            )
+        else:
+            doc_links = {}
+
         prompt = None
         if context_parts:
             context = "\n\n".join(context_parts)
@@ -896,6 +942,7 @@ class SupermicroChatbot:
         return {
             "prompt": prompt,
             "sources": sources,
+            "doc_links": doc_links,
             "chunks": chunks,
             "plan": plan,
             "search_queries": search_queries,
@@ -903,26 +950,126 @@ class SupermicroChatbot:
             "max_per_source": max_per_source,
         }
 
+    # ------------------------------------------------------------------
+    # PDF URL map  (crawled links from discovered_pdfs.txt)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_pdf_url_map() -> dict[str, str]:
+        """Build {pdf_filename: download_url} from the crawler's discovered_pdfs.txt.
+
+        File format: ``<pdf_url>\\t<page_found_on>`` (one per line).
+        We key by the filename portion of the URL (e.g. ``SC813M.pdf``)
+        so we can match against chunk ``source_file`` values.
+        """
+        pdf_map: dict[str, str] = {}
+        candidates = [
+            Path(__file__).resolve().parents[1] / "data" / "discovered_pdfs.txt",
+        ]
+        for p in candidates:
+            if not p.exists():
+                continue
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or "\t" not in line:
+                        continue
+                    url = line.split("\t", 1)[0].strip()
+                    if not url.lower().endswith(".pdf"):
+                        continue
+                    filename = url.rsplit("/", 1)[-1].split("?")[0]
+                    # Keep first occurrence (http → https duplicates)
+                    if filename not in pdf_map:
+                        pdf_map[filename] = url
+        if pdf_map:
+            print(f"[PDF URL Map] Loaded {len(pdf_map)} PDF download links")
+        return pdf_map
+
+    # ------------------------------------------------------------------
+    # Single-link builder
+    # ------------------------------------------------------------------
+
+    def _build_doc_links(self, sources, chunks, catalog_products=None):
+        """Return ``{label: url}`` with at most ONE link.
+
+        Priority:
+        1. Match a source PDF filename against the crawled PDF URL map
+           (direct download link from supermicro.com).
+        2. Real ``Source URL:`` embedded in a chunk by the crawler.
+        3. Catalog eStore URL.
+        """
+        # --- 1) PDF URL map lookup (exact filename match) ---
+        for sf in sources:
+            if not sf.endswith(".pdf"):
+                continue
+            # Strip hash suffix: SC813M__f0542fcbff.pdf → SC813M.pdf
+            base = sf.split("__")[0]
+            if not base.endswith(".pdf"):
+                base += ".pdf"
+            if base in self._pdf_url_map:
+                label = base.replace(".pdf", "") + " User Manual (PDF)"
+                return {label: self._pdf_url_map[base]}
+
+        # --- 2) Source URL in chunk text ---
+        for chunk in chunks:
+            m = re.search(r'Source URL:\s*(https?://\S+)', chunk.get("text", ""))
+            if m:
+                url = m.group(1).rstrip(".,;)")
+                slug = url.rstrip("/").rsplit("/", 1)[-1].upper()
+                return {slug: url}
+
+        # --- 3) catalog eStore URL ---
+        if catalog_products:
+            for p in catalog_products:
+                url = p.get("url")
+                if url:
+                    label = p.get("sku") or p.get("name", "Product Page")
+                    return {label: url}
+
+        return {}
+
+    @staticmethod
+    def _format_links_block(doc_links: dict) -> str:
+        """Append a single clickable link to the LLM response."""
+        if not doc_links:
+            return ""
+        label, url = next(iter(doc_links.items()))
+        return f"\n\n> **[{label}]({url})**\n"
+
+    # ------------------------------------------------------------------
+    # Streaming answer
+    # ------------------------------------------------------------------
+
     def answer_stream(self, question: str, conversation_context: str = ""):
         """Yield (event, data) tuples for SSE streaming.
 
-        Events: ("sources", json_list), ("token", text), ("done", "").
+        Events: ("sources", json_list), ("doc_links", json_obj),
+                ("token", text), ("done", "").
         """
         import json as _json
         ctx = self._retrieve_context(question, conversation_context)
 
         yield ("sources", _json.dumps(ctx["sources"]))
+        if ctx.get("doc_links"):
+            yield ("doc_links", _json.dumps(ctx["doc_links"]))
 
         if ctx["prompt"] is None:
             yield ("token", "No relevant information found in the documentation.")
             yield ("done", "")
             return
 
+        _temp = self._effective_temperature(ctx["plan"].intent)
+
         for token in get_llm_response_stream(
             ctx["prompt"], self.llm_model, self.llm_provider,
-            self.temperature, self.top_p,
+            _temp, self.top_p,
         ):
             yield ("token", token)
+
+        # Append clickable document links directly after the LLM response
+        links_block = self._format_links_block(ctx.get("doc_links", {}))
+        if links_block:
+            yield ("token", links_block)
 
         yield ("done", "")
 
@@ -948,10 +1095,18 @@ class SupermicroChatbot:
                 "2. Use a helpful, customer-service tone. Keep the response short — no tables or lengthy spec lists.\n"
                 "3. If the FAQ doesn't cover this specific question, suggest contacting Supermicro support via live chat or email."
             )
+        elif intent in ("detail", "list", "compare", "follow_up"):
+            instructions = (
+                "1. Answer ONLY from the reference documents provided. Do NOT supplement with outside knowledge or part numbers not found in the documents.\n"
+                "2. If a part number, spec, or detail is not in the documents, say it is not available rather than guessing.\n"
+                "3. If this is a follow-up question, use conversation history for context."
+            )
         else:
             instructions = (
-                "1. Use the reference documents as your primary source. You may supplement with general domain knowledge for context, but never invent specific specs or part numbers.\n"
-                "2. If this is a follow-up question, use conversation history for context."
+                "1. Answer ONLY from the reference documents. State facts found in the documents.\n"
+                "2. If a hardware component (CPU, GPU, memory, etc.) is not listed as supported in the documents, say it is NOT listed as supported. Do NOT fabricate a technical reason for incompatibility.\n"
+                "3. Be concise — a few sentences is often enough.\n"
+                "4. If this is a follow-up question, use conversation history for context."
             )
 
         prompt = f"""{conversation_section}## REFERENCE DOCUMENTS
@@ -1027,8 +1182,13 @@ def main():
     )
     parser.add_argument(
         "--index-dir",
-        default="embeddings/faiss_index/",
-        help="Directory containing FAISS index (default: embeddings/faiss_index/)"
+        default="embeddings/primary_index/",
+        help="Directory containing primary FAISS index (default: embeddings/primary_index/)"
+    )
+    parser.add_argument(
+        "--manual-dir",
+        default="embeddings/manual_index/",
+        help="Directory containing manual FAISS index (default: embeddings/manual_index/)"
     )
     parser.add_argument(
         "--embedding-model",
@@ -1060,9 +1220,9 @@ def main():
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.5"))
     top_p = float(os.getenv("LLM_TOP_P", "1.0"))
     
-    # Initialize chatbot
     chatbot = SupermicroChatbot(
         index_dir=args.index_dir,
+        manual_dir=args.manual_dir,
         embedding_model=args.embedding_model,
         llm_model=llm_model,
         llm_provider=llm_provider,

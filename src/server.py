@@ -10,11 +10,12 @@ Routes:
 from __future__ import annotations
 
 import os
+import urllib.parse
 from pathlib import Path
 from typing import Optional, List, TYPE_CHECKING
 import sys
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = REPO_ROOT / "static"
+PDF_DIR = REPO_ROOT / os.getenv("PDF_DIR", "data/pdfs")
 
 _chatbot: Optional["SupermicroChatbot"] = None
 
@@ -44,7 +46,8 @@ def get_chatbot() -> SupermicroChatbot:
     # even if FAISS / sentence-transformers are slow to import or misconfigured.
     from src.chatbot import SupermicroChatbot
 
-    index_dir = os.getenv("INDEX_DIR", "embeddings/faiss_index/")
+    index_dir = os.getenv("INDEX_DIR", "embeddings/primary_index/")
+    manual_dir = os.getenv("MANUAL_INDEX_DIR", "embeddings/manual_index/")
     embedding_model = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     llm_model = os.getenv("LLM_MODEL", "gpt-5.2")
     llm_provider = os.getenv("LLM_PROVIDER", "openai")
@@ -54,6 +57,7 @@ def get_chatbot() -> SupermicroChatbot:
 
     _chatbot = SupermicroChatbot(
         index_dir=index_dir,
+        manual_dir=manual_dir,
         embedding_model=embedding_model,
         llm_model=llm_model,
         llm_provider=llm_provider,
@@ -197,12 +201,13 @@ def chat(req: ChatRequest):
     return {
         "answer": result.get("answer", ""),
         "sources": result.get("sources", []),
+        "doc_links": result.get("doc_links", {}),
     }
 
 
 @app.post("/api/chat/stream")
 def chat_stream(req: ChatRequest):
-    """SSE streaming endpoint. Emits events: sources, token, done."""
+    """SSE streaming endpoint. Emits: sources, doc_links, token, done."""
     bot = get_chatbot()
     conversation_context = _build_conversation_context(req.history)
 

@@ -57,11 +57,10 @@ do_push() {
         aws s3 sync "$PROJECT_DIR/src/"     "${S3_BASE}/src/"     --delete
         aws s3 sync "$PROJECT_DIR/scripts/" "${S3_BASE}/scripts/" --delete --exclude "*.pyc"
         aws s3 sync "$PROJECT_DIR/static/"  "${S3_BASE}/static/"  --delete
-        aws s3 sync "$PROJECT_DIR/config/"  "${S3_BASE}/config/"  --delete
         aws s3 sync "$PROJECT_DIR/tests/"   "${S3_BASE}/tests/"   --delete --exclude "__pycache__/*"
         aws s3 sync "$PROJECT_DIR/docs/"    "${S3_BASE}/docs/"    --delete
 
-        for f in requirements.txt setup_rag.py Dockerfile .dockerignore README.md architecture.md .env.example; do
+        for f in requirements.txt setup_rag.py Dockerfile .dockerignore README.md .env.example; do
             [[ -f "$PROJECT_DIR/$f" ]] && aws s3 cp "$PROJECT_DIR/$f" "${S3_BASE}/$f"
         done
 
@@ -106,11 +105,10 @@ do_pull() {
         aws s3 sync "${S3_BASE}/src/"     "$PROJECT_DIR/src/"     --delete
         aws s3 sync "${S3_BASE}/scripts/" "$PROJECT_DIR/scripts/" --delete
         aws s3 sync "${S3_BASE}/static/"  "$PROJECT_DIR/static/"  --delete
-        aws s3 sync "${S3_BASE}/config/"  "$PROJECT_DIR/config/"  --delete
         aws s3 sync "${S3_BASE}/tests/"   "$PROJECT_DIR/tests/"   --delete
         aws s3 sync "${S3_BASE}/docs/"    "$PROJECT_DIR/docs/"    --delete
 
-        for f in requirements.txt setup_rag.py Dockerfile .dockerignore README.md architecture.md .env.example .env; do
+        for f in requirements.txt setup_rag.py Dockerfile .dockerignore README.md .env.example .env; do
             aws s3 cp "${S3_BASE}/$f" "$PROJECT_DIR/$f" 2>/dev/null || true
         done
         ok "Source code synced"

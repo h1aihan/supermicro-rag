@@ -1,6 +1,7 @@
 .env
 .venv
 venv
+.git/
 __pycache__/
 *.pyc
 *.pyo
@@ -8,14 +9,19 @@ __pycache__/
 .Python
 .vscode/
 .idea/
+.cursor/
 *.log
 
-# Large / not needed to run the hosted service
+# Large / not needed to run the hosted service — SCP'd to EC2 and volume-mounted
 pdfs/
 data/
-# embeddings/ - INCLUDED for deployment (required for search)
-project.zip
-project_f.zip
-project_embeddings.zip
+embeddings/
+
+# Not needed at runtime
+tests/
+docs/
+scripts/
+*.md
+*.zip
 aws/
 

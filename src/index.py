@@ -60,13 +60,15 @@ class HybridIndex:
     Uses Reciprocal Rank Fusion (RRF) to combine results.
     """
     
-    def __init__(self, index_dir: str, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, index_dir: str, model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+                 shared_model=None):
         """
         Initialize the hybrid index.
         
         Args:
             index_dir: Directory containing FAISS index, BM25 index, and metadata
             model_name: Name of the sentence transformer model
+            shared_model: Pre-loaded SentenceTransformer to reuse (saves memory)
         """
         self.index_dir = Path(index_dir)
         self.model_name = model_name
@@ -74,6 +76,7 @@ class HybridIndex:
         self.faiss_index = None
         self.bm25 = None
         self.metadata = []
+        self._shared_model = shared_model
         
         self._load_faiss_index()
         self._load_bm25_index()
@@ -130,7 +133,11 @@ class HybridIndex:
         print(f"Built filename index: {len(self._filename_index)} unique tokens across {len(self.metadata)} chunks")
 
     def _load_model(self):
-        """Load sentence transformer model."""
+        """Load sentence transformer model (or reuse shared instance)."""
+        if self._shared_model is not None:
+            self.model = self._shared_model
+            print(f"Reusing shared embedding model")
+            return
         print(f"Loading embedding model: {self.model_name}...")
         self.model = SentenceTransformer(self.model_name)
 
@@ -326,6 +333,34 @@ class HybridIndex:
         
         return False
     
+    # Pre-compiled regexes for source-type classification
+    _RE_MANUAL = re.compile(r'^MNL-', re.IGNORECASE)
+    _RE_GUIDE = re.compile(r'[Uu]ser[_\s]?[Gg]uide|^QRG-|^BMC_IPMI|^IPMI', re.IGNORECASE)
+    _RE_CHASSIS = re.compile(r'^(?:SC\d|CSE-)', re.IGNORECASE)
+
+    def _source_type_boost(self, source_file: str) -> float:
+        """Return a score multiplier based on document type.
+
+        Datasheets and web pages are concise, high-signal content.
+        Manuals are verbose and numerous — dampen them so they don't
+        drown out datasheets in retrieval.
+        """
+        if source_file.startswith('web_page_FAQ'):
+            return 1.4
+        if source_file.startswith('accessory_'):
+            return 1.3
+        if source_file.startswith('web_page_') or source_file.startswith('web_product_'):
+            return 1.2
+        if self._RE_MANUAL.search(source_file):
+            return 0.6
+        if self._RE_GUIDE.search(source_file):
+            return 0.7
+        if self._RE_CHASSIS.search(source_file):
+            return 1.0
+        if source_file.endswith('.pdf'):
+            return 1.15
+        return 1.0
+
     def _expand_query_for_bm25(self, query: str) -> str:
         """
         Expand query with stemmed variants for better BM25 matching.
@@ -473,20 +508,13 @@ class HybridIndex:
                 text = meta.get('text', '')
                 
                 # Penalize chunks that are mostly boilerplate footer text
-                # (the "As a global leader...broad range of SKUs" paragraph
-                #  appears in hundreds of Supermicro PDFs and pollutes keyword search)
                 text_flat = re.sub(r'\s+', ' ', text.lower())
                 if 'global leader in high performance' in text_flat and \
                    'broad range of skus' in text_flat:
-                    rrf_scores[idx] *= 0.3  # Heavy penalty for boilerplate chunks
+                    rrf_scores[idx] *= 0.3
                     continue
                 
-                # Source-based boosting
-                if source_file.endswith('.pdf'):
-                    rrf_scores[idx] *= 1.05  # Subtle PDF preference as tiebreaker
-                elif source_file.startswith('web_product_'):
-                    rrf_scores[idx] *= 1.02  # Minimal boost for structured product data
-                # web_page_* content: no boost (1.0x)
+                rrf_scores[idx] *= self._source_type_boost(source_file)
         
         # Sort by combined RRF score (with source boost applied)
         sorted_indices = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
@@ -567,6 +595,96 @@ class HybridIndex:
 
 # Backward compatibility alias
 VectorIndex = HybridIndex
+
+
+class RoutedIndex:
+    """Multi-index wrapper that routes queries to primary and/or manual indices.
+
+    The primary index holds datasheets, web pages, accessories, and FAQ.
+    The manual index holds user guides, installation manuals, and QRGs.
+    Queries are routed based on a ``scope`` parameter:
+      - "primary" (default): search only the primary index
+      - "both": search primary, then supplement with manual index results
+
+    The manual index loads in a background thread so the server starts fast.
+    Queries arriving before it's ready fall back to primary-only search.
+    """
+
+    def __init__(self, primary_dir: str, manual_dir: Optional[str] = None,
+                 model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        self.primary = HybridIndex(primary_dir, model_name)
+        self._model_name = model_name
+        self.manual: Optional[HybridIndex] = None
+        self._manual_loading = False
+        print(f"[RoutedIndex] Primary index: {self.primary.faiss_index.ntotal:,} vectors")
+
+        if manual_dir:
+            manual_path = Path(manual_dir)
+            if manual_path.exists() and (manual_path / "faiss.index").exists():
+                self._manual_loading = True
+                import threading
+                t = threading.Thread(target=self._load_manual_bg,
+                                     args=(manual_dir,), daemon=True)
+                t.start()
+                print(f"[RoutedIndex] Manual index loading in background thread...")
+            else:
+                print(f"[RoutedIndex] No manual index at {manual_dir} — manual scope disabled")
+
+    def _load_manual_bg(self, manual_dir: str):
+        """Load manual index in background thread."""
+        try:
+            import time
+            t0 = time.time()
+            self.manual = HybridIndex(manual_dir, self._model_name,
+                                      shared_model=self.primary.model)
+            elapsed = time.time() - t0
+            print(f"[RoutedIndex] Manual index ready: {self.manual.faiss_index.ntotal:,} vectors "
+                  f"({elapsed:.0f}s)")
+        except Exception as e:
+            print(f"[RoutedIndex] Manual index failed to load: {e}")
+        finally:
+            self._manual_loading = False
+
+    def search_hybrid(self, query: str, top_k: int = 10, scope: str = "primary",
+                      manual_top_k: int = 5, **kwargs) -> List[Tuple[Dict, float]]:
+        """Search primary and/or manual index based on scope.
+
+        scope="primary": primary only (default)
+        scope="manual": manual only
+        scope="both": primary + supplemental manual results
+
+        Falls back to primary if manual index is not yet ready.
+        """
+        manual = self.manual  # snapshot — safe even if loading in background
+
+        if scope == "manual":
+            if manual:
+                return manual.search_hybrid(query, top_k, **kwargs)
+            if self._manual_loading:
+                print("[RoutedIndex] Manual index still loading — falling back to primary")
+            return self.primary.search_hybrid(query, top_k, **kwargs)
+
+        results = self.primary.search_hybrid(query, top_k, **kwargs)
+        if scope == "both" and manual:
+            manual_results = manual.search_hybrid(query, manual_top_k, **kwargs)
+            seen = {r[0].get('chunk_id') for r in results}
+            for chunk, score in manual_results:
+                cid = chunk.get('chunk_id')
+                if cid not in seen:
+                    seen.add(cid)
+                    results.append((chunk, score))
+        return results
+
+    def search_faq_questions(self, query: str, top_k: int = 5):
+        return self.primary.search_faq_questions(query, top_k)
+
+    @property
+    def metadata(self):
+        return self.primary.metadata
+
+    @property
+    def model(self):
+        return self.primary.model
 
 
 if __name__ == "__main__":

@@ -149,7 +149,11 @@
         color: var(--muted);
         font-size: 12px;
       }
-      .sources ul { margin: 6px 0 0; padding-left: 18px; }
+      .sources ul { margin: 6px 0 0; padding-left: 18px; list-style: none; }
+      .sources li { position: relative; padding-left: 14px; margin: 3px 0; }
+      .sources li::before { content: "›"; position: absolute; left: 0; color: var(--sm-green); font-weight: 700; }
+      .sources a { color: #7db5ff; text-decoration: none; border-bottom: 1px solid rgba(125,181,255,0.25); transition: border-color 0.15s; }
+      .sources a:hover { border-bottom-color: #7db5ff; }
       .composer {
         display: grid;
         grid-template-columns: 1fr auto;
@@ -271,11 +275,48 @@
         try {
           return marked.parse(text || "");
         } catch (e) {
-          // Fallback to plain text if markdown parsing fails
           const div = document.createElement("div");
           div.textContent = text;
           return div.innerHTML;
         }
+      }
+
+      function prettySourceName(raw) {
+        if (raw.startsWith("Product Catalog")) return raw;
+        if (raw.startsWith("web_product_"))
+          return raw.slice(12).replace(/\.txt$/, "").replace(/[-_]/g, " ");
+        if (raw.startsWith("web_page_"))
+          return raw.slice(9).replace(/\.txt$/, "").split("|")[0].replace(/_/g, " ").trim();
+        if (raw.startsWith("datasheet_"))
+          return raw.replace(/\.pdf$/, "").replace(/_[a-f0-9]{8,}$/, "").replace(/_/g, " ");
+        if (/^MNL-/i.test(raw))
+          return raw.replace(/\.pdf$/i, "") + " (User Manual)";
+        return raw;
+      }
+
+      function buildSourcesList(sources, docLinks) {
+        const s = document.createElement("div");
+        s.className = "sources";
+        const ul = document.createElement("ul");
+        for (const src of sources) {
+          const li = document.createElement("li");
+          const label = prettySourceName(src);
+          const url = docLinks[src];
+          if (url) {
+            const a = document.createElement("a");
+            a.href = url;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            a.textContent = label;
+            li.appendChild(a);
+          } else {
+            li.textContent = label;
+          }
+          ul.appendChild(li);
+        }
+        s.appendChild(document.createTextNode("Sources:"));
+        s.appendChild(ul);
+        return s;
       }
       const messagesEl = $("messages");
       const inputEl = $("input");
@@ -289,7 +330,7 @@
         healthEl.textContent = text;
       }
 
-      function addMessage(role, text, sources = null, { loading = false } = {}) {
+      function addMessage(role, text, sources = null, { loading = false, docLinks = {} } = {}) {
         const box = document.createElement("div");
         box.className = "msg " + role + (loading ? " loading" : "");
         const meta = document.createElement("div");
@@ -313,17 +354,7 @@
         box.appendChild(body);
 
         if (sources && sources.length) {
-          const s = document.createElement("div");
-          s.className = "sources";
-          const ul = document.createElement("ul");
-          for (const src of sources) {
-            const li = document.createElement("li");
-            li.textContent = src;
-            ul.appendChild(li);
-          }
-          s.appendChild(document.createTextNode("Sources:"));
-          s.appendChild(ul);
-          box.appendChild(s);
+          box.appendChild(buildSourcesList(sources, docLinks || {}));
         }
 
         messagesEl.appendChild(box);
@@ -370,6 +401,7 @@
           let buf = "";
           let streamStarted = false;
           let sources = [];
+          let docLinks = {};
 
           while (true) {
             const { value, done } = await reader.read();
@@ -390,6 +422,8 @@
 
               if (event === "sources") {
                 try { sources = JSON.parse(data); } catch {}
+              } else if (event === "doc_links") {
+                try { docLinks = JSON.parse(data); } catch {}
               } else if (event === "token") {
                 if (!streamStarted) {
                   streamStarted = true;
@@ -403,17 +437,7 @@
                 messagesEl.scrollTop = messagesEl.scrollHeight;
               } else if (event === "done") {
                 if (sources.length) {
-                  const s = document.createElement("div");
-                  s.className = "sources";
-                  const ul = document.createElement("ul");
-                  for (const src of sources) {
-                    const li = document.createElement("li");
-                    li.textContent = src;
-                    ul.appendChild(li);
-                  }
-                  s.appendChild(document.createTextNode("Sources:"));
-                  s.appendChild(ul);
-                  pending.box.appendChild(s);
+                  pending.box.appendChild(buildSourcesList(sources, docLinks));
                 }
                 messagesEl.scrollTop = messagesEl.scrollHeight;
               }

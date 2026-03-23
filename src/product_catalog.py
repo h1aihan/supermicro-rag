@@ -131,12 +131,55 @@ class ProductCatalog:
         product["cpu_count"] = cpu_count
 
         all_text_lower = f"{name} {cpu_field} {product.get('category', '')}".lower()
+        sku_upper = product.get("sku", "").upper().replace(" ", "")
         cpu_family = ""
         if "epyc" in all_text_lower:
             cpu_family = "EPYC"
         elif "xeon" in all_text_lower:
             cpu_family = "Xeon"
+        elif sku_upper.startswith("AS-"):
+            cpu_family = "EPYC"
+        elif sku_upper.startswith("SYS-"):
+            cpu_family = "Xeon"
         product["cpu_family"] = cpu_family
+
+        # Detect platform generation from model URL or product name (H12-H14, X12-X14)
+        model_url = product.get("model", "").lower()
+        platform_gen = ""
+        for gen in ["h14", "h13", "h12", "x14", "x13", "x12"]:
+            if gen in model_url or gen in name_lower:
+                platform_gen = gen.upper()
+                break
+        if not platform_gen and sku_upper.startswith("AS-"):
+            platform_gen = "AMD"
+        elif not platform_gen and sku_upper.startswith("SYS-"):
+            platform_gen = "Intel"
+        product["platform_generation"] = platform_gen
+
+        # Detect specific CPU series from cpu field text and platform generation
+        cpu_series = []
+        if "9005" in cpu_field or "turin" in cpu_field.lower():
+            cpu_series.append("EPYC 9005")
+        if "9004" in cpu_field or "genoa" in cpu_field.lower() or "bergamo" in cpu_field.lower():
+            cpu_series.append("EPYC 9004")
+        if "7003" in cpu_field or "milan" in cpu_field.lower():
+            cpu_series.append("EPYC 7003")
+        if "xeon 6" in cpu_field.lower() or "granite" in cpu_field.lower() or "sierra" in cpu_field.lower():
+            cpu_series.append("Xeon 6")
+        if "5th gen" in cpu_field.lower() or "emerald" in cpu_field.lower():
+            cpu_series.append("Xeon 5th Gen")
+        if "4th gen" in cpu_field.lower() or "sapphire" in cpu_field.lower():
+            cpu_series.append("Xeon 4th Gen")
+
+        # Infer additional CPU series from platform generation when data is incomplete
+        if platform_gen == "H14" and "EPYC 9005" not in cpu_series:
+            cpu_series.append("EPYC 9005")
+        if platform_gen == "H14" and "EPYC 9004" not in cpu_series and cpu_family == "EPYC":
+            cpu_series.append("EPYC 9004")
+        if platform_gen == "H13" and not cpu_series and cpu_family == "EPYC":
+            cpu_series.extend(["EPYC 9004", "EPYC 9005"])
+
+        product["cpu_series"] = cpu_series
 
         drive_bay_count = 0
         drive_size = ""
@@ -159,6 +202,8 @@ class ProductCatalog:
             product.get("network", ""), chassis,
             " ".join(tags),
             cpu_family,
+            " ".join(cpu_series),
+            platform_gen,
         ]
         product["_search_text"] = " ".join(search_parts).lower()
     
@@ -349,7 +394,10 @@ class ProductCatalog:
             
             details = []
             if p.get("cpu"):
-                details.append(f"CPU: {p['cpu']}")
+                cpu_detail = p['cpu']
+                if p.get("cpu_series"):
+                    cpu_detail += f" (Supports: {', '.join(p['cpu_series'])})"
+                details.append(f"CPU: {cpu_detail}")
             if p.get("gpu"):
                 details.append(f"GPU: {p['gpu']}")
             if p.get("memory"):

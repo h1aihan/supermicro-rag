@@ -61,6 +61,12 @@ class QueryPlan:
     # (e.g., accessories, parts, compatible components, motherboard details)
     accessory_query: bool = False
 
+    # Which index pools to search: "primary" | "both" | "manual"
+    search_scope: str = "primary"
+
+    # Document type the user is looking for: "any" | "manual" | "datasheet" | "faq"
+    doc_type_hint: str = "any"
+
     def __repr__(self):
         parts = [f"intent={self.intent}"]
         if self.product_codes:
@@ -75,6 +81,10 @@ class QueryPlan:
             parts.append(f"kw={self.keywords}")
         parts.append(f"catalog={'Y' if self.use_catalog else 'N'}")
         parts.append(f"rag={'Y' if self.use_rag else 'N'}")
+        if self.search_scope != "primary":
+            parts.append(f"scope={self.search_scope}")
+        if self.doc_type_hint != "any":
+            parts.append(f"doc={self.doc_type_hint}")
         if self.accessory_query:
             parts.append("graph_expand=Y")
         return f"QueryPlan({', '.join(parts)})"
@@ -125,7 +135,8 @@ Intel CPU generation to Supermicro platform mapping (important — do not confus
 AMD CPU generation to Supermicro platform mapping:
 - AMD EPYC 7003 (Milan) = H12
 - AMD EPYC 9004 (Genoa/Bergamo) = H13
-- AMD EPYC 9005 (Turin) = H14
+- AMD EPYC 9005 (Turin) = H14 (native), but also supported on many H13 products via BIOS/firmware update
+IMPORTANT: When user asks for EPYC 9005 systems, include BOTH H14 and H13 in search queries, since many H13 products support EPYC 9005 with board revision 2.x. Do NOT limit search to H14 only.
 
 ## GPU / ACCELERATOR QUERIES
 - "HGX" is NVIDIA's GPU baseboard platform name, NOT a Supermicro product code. NEVER put "HGX-B200", "HGX-H100", etc. in product_codes. Use them as search keywords only.
@@ -153,8 +164,25 @@ AMD CPU generation to Supermicro platform mapping:
   "search_queries": ["query1", "query2"],
   "use_catalog": true/false,
   "use_rag": true/false,
-  "accessory_query": true/false
+  "accessory_query": true/false,
+  "search_scope": "primary"|"both"|"manual",
+  "doc_type_hint": "any"|"manual"|"datasheet"|"faq"
 }
+
+## search_scope FIELD
+Controls which document index pools are searched:
+- "primary" (default): Product datasheets, web pages, accessories, FAQ. Use for most queries.
+- "manual": ONLY chassis/user manuals and installation guides. Use when doc_type_hint="manual".
+- "both": Searches both primary and manual indices. Use when the question asks about BIOS configuration, installation/setup procedures, troubleshooting steps, firmware updates, error codes, beep codes, hardware replacement steps, or other topics found in user manuals rather than datasheets.
+
+## doc_type_hint FIELD
+Indicates what TYPE of document the user is looking for:
+- "any" (default): No specific document type preference.
+- "manual": User is asking about or looking for a user manual, installation guide, chassis manual, or documentation location. Set search_scope="manual".
+- "datasheet": User is asking for product specs, datasheet info. Set search_scope="primary".
+- "faq": User is asking an eStore operational question. Set search_scope="primary".
+
+IMPORTANT: When user asks "where is the manual for X?" or "I need the user guide for X", this is NOT an FAQ — it is intent="detail" with doc_type_hint="manual" and search_scope="manual". The intent="faq" is ONLY for eStore operational questions (ordering, shipping, returns, account) that do NOT reference a specific product's documentation.
 
 ## accessory_query FIELD
 Set accessory_query=true when the user asks about parts, accessories, or components that may live in a DIFFERENT document than the main product datasheet. This triggers cross-document graph lookup to find related information across documents (e.g., chassis pages, parts lists, compatibility tables).
@@ -238,9 +266,11 @@ Rules for FAQ queries:
 - Do NOT set form_factor, tags, or product_codes — these are not product queries
 
 Distinguishing FAQ from other intents:
-- FAQ = eStore operational questions (policies, account, ordering process)
-- detail = product specs or hardware questions about a specific model
+- FAQ = eStore operational questions (policies, account, ordering process) with NO specific product code
+- detail = product specs, hardware questions, or documentation requests about a specific model (including "where is the manual for X?")
 - general = broad technical concepts not tied to eStore operations
+- "Where is the manual/user guide for [product]?" → intent=detail, doc_type_hint=manual (NOT faq)
+- "How do I install [product]?" → intent=detail, doc_type_hint=manual, search_scope=manual
 
 ## GUIDELINES
 - For "faq" intent: use_catalog=false, use_rag=true
@@ -460,7 +490,21 @@ def _parse_plan(raw: str, original_query: str) -> QueryPlan:
 
     # Accessory / graph-expansion flag
     plan.accessory_query = bool(data.get("accessory_query", False))
-    
+
+    # Index routing scope
+    scope = data.get("search_scope", "primary")
+    plan.search_scope = scope if scope in ("primary", "both", "manual") else "primary"
+
+    # Document type hint
+    dth = data.get("doc_type_hint", "any")
+    plan.doc_type_hint = dth if dth in ("any", "manual", "datasheet", "faq") else "any"
+
+    # Auto-align scope with doc_type_hint
+    if plan.doc_type_hint == "manual":
+        plan.search_scope = "manual"
+    elif plan.doc_type_hint == "datasheet":
+        plan.search_scope = "primary"
+
     # Safety: ensure at least one retrieval path
     if not plan.use_catalog and not plan.use_rag:
         plan.use_rag = True
@@ -491,6 +535,16 @@ def _fallback_plan(query: str) -> QueryPlan:
         plan.use_rag = True
         print(f"[QueryPlanner] Fallback plan: {plan}")
         return plan
+
+    # Detect documentation-type queries → doc_type_hint + search_scope
+    _doc_kw = r'\b(user\s*manual|manual|user\s*guide|installation\s*guide|chassis\s*manual|documentation)\b'
+    if re.search(_doc_kw, q):
+        plan.doc_type_hint = "manual"
+        plan.search_scope = "manual"
+    else:
+        _manual_kw = r'\b(bios|install|configure|setup|troubleshoot|error|firmware|update|flash|recovery|beep\s*code|memtest|jumper|dip\s*switch)\b'
+        if re.search(_manual_kw, q):
+            plan.search_scope = "both"
 
     # Detect listing intent
     _pt = r'(skus?|servers?|systems?|products?|solutions?|models?|series|configurations?)'

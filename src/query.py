@@ -13,9 +13,9 @@ from collections import defaultdict
 # - python -m src.query   (package mode)
 # - python src/query.py   (script mode)
 try:
-    from src.index import HybridIndex
+    from src.index import HybridIndex, RoutedIndex
 except ImportError:
-    from index import HybridIndex
+    from index import HybridIndex, RoutedIndex
 
 
 # =============================================================================
@@ -164,19 +164,23 @@ class RAGQueryProcessor:
         self, 
         index_dir: str, 
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        enable_reranking: bool = True
+        enable_reranking: bool = True,
+        manual_dir: Optional[str] = None,
     ):
         """
         Initialize the query processor with hybrid search (FAISS + BM25) and optional reranking.
         
         Args:
-            index_dir: Directory containing FAISS index, BM25 index, and metadata
+            index_dir: Directory containing primary FAISS index, BM25 index, and metadata
             model_name: Name of the sentence transformer model
             enable_reranking: Whether to use cross-encoder reranking
+            manual_dir: Optional directory containing the manual index (user guides, etc.)
         """
-        self.index = HybridIndex(index_dir, model_name)
+        self.index = RoutedIndex(index_dir, manual_dir, model_name)
         self.enable_reranking = enable_reranking and (os.getenv("ENABLE_RERANKING", "1") != "0")
     
+    FAQ_QBANK_MIN_SCORE = 0.55
+
     def retrieve_faq(
         self,
         query: str,
@@ -197,6 +201,8 @@ class RAGQueryProcessor:
         chunks = []
         seen_ids: set = set()
         for _qi, question, score, chunk_indices in faq_matches:
+            if score < self.FAQ_QBANK_MIN_SCORE:
+                continue
             for idx in chunk_indices:
                 if idx < len(self.index.metadata):
                     meta = self.index.metadata[idx]
@@ -211,10 +217,11 @@ class RAGQueryProcessor:
                             "faq_question": question,
                         })
 
-        print(f"[DEBUG] FAQ question bank: {len(faq_matches)} questions matched, "
-              f"{len(chunks)} chunks")
-        for _qi, question, score, _ in faq_matches[:3]:
-            print(f"[DEBUG]   {score:.4f} '{question[:80]}'")
+        print(f"[DEBUG] FAQ question bank: {len(faq_matches)} raw, "
+              f"{len(chunks)} above threshold ({self.FAQ_QBANK_MIN_SCORE})")
+        for _qi, question, score, _ in faq_matches[:5]:
+            marker = "✓" if score >= self.FAQ_QBANK_MIN_SCORE else "✗"
+            print(f"[DEBUG]   {marker} {score:.4f} '{question[:80]}'")
 
         return chunks[:top_k]
 
@@ -224,28 +231,25 @@ class RAGQueryProcessor:
         top_k: int = 10,
         max_per_source: Optional[int] = None,
         source_filter: Optional[str] = None,
+        scope: str = "primary",
     ) -> List[Dict]:
         """
         Retrieve relevant chunks using hybrid search.
-        
-        Pipeline:
-        1. Preprocess query (expand product codes like "521GE" → "SYS-521GE")
-        2. Hybrid search (FAISS semantic + BM25 keyword)
         
         Args:
             query: User query
             top_k: Number of chunks to return
             max_per_source: If set, cap chunks per source file for diversity
             source_filter: If set, restrict to chunks whose source_file contains this string
+            scope: "primary" (default), "manual" (manual only), or "both" (primary + manual)
             
         Returns:
             List of chunk dictionaries with similarity scores
         """
-        # Step 1: Preprocess query to expand product codes
         expanded_query = preprocess_query(query)
         
-        # Step 2: Hybrid search
-        results = self.index.search_hybrid(expanded_query, top_k, max_per_source=max_per_source,
+        results = self.index.search_hybrid(expanded_query, top_k, scope=scope,
+                                           max_per_source=max_per_source,
                                            source_filter=source_filter)
         
         # Convert to list of dicts

@@ -4,10 +4,37 @@ Setup script to run the complete RAG pipeline.
 Supports both PDF documents and web page content.
 """
 
+import json
+import re
 import subprocess
 import sys
 import argparse
 from pathlib import Path
+
+_RE_MANUAL = re.compile(r'^MNL-', re.IGNORECASE)
+_RE_GUIDE = re.compile(r'[Uu]ser[_\s]?[Gg]uide|^QRG-|^BMC_IPMI|^IPMI', re.IGNORECASE)
+_RE_CHASSIS_MANUAL = re.compile(r'^SC\d{3}', re.IGNORECASE)
+
+
+def split_chunks(input_file: str, primary_output: str, manual_output: str):
+    """Split chunks.jsonl into primary (datasheets, web, accessories) and manual indices."""
+    primary_count = manual_count = 0
+    with open(input_file, 'r', encoding='utf-8') as fin, \
+         open(primary_output, 'w', encoding='utf-8') as fp, \
+         open(manual_output, 'w', encoding='utf-8') as fm:
+        for line in fin:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            source = obj.get('source_file', '')
+            if _RE_MANUAL.search(source) or _RE_GUIDE.search(source) or _RE_CHASSIS_MANUAL.search(source):
+                fm.write(line)
+                manual_count += 1
+            else:
+                fp.write(line)
+                primary_count += 1
+    print(f"  Split complete: {primary_count:,} primary, {manual_count:,} manual chunks")
+    return primary_count, manual_count
 
 
 def run_command(cmd, description, allow_fail=False):
@@ -35,9 +62,9 @@ def main():
     parser = argparse.ArgumentParser(description="Setup Supermicro RAG pipeline")
     parser.add_argument(
         "--filter",
-        choices=['datasheet', 'all'],
-        default='datasheet',
-        help="Filter PDFs: 'datasheet' (default, recommended) or 'all'"
+        choices=['datasheet', 'product', 'all'],
+        default='product',
+        help="Filter PDFs: 'datasheet' (specs only), 'product' (default, datasheets + chassis + manuals), 'all' (everything)"
     )
     parser.add_argument(
         "--source",
@@ -111,17 +138,40 @@ def main():
     # Step 3: Chunk the text from all sources
     chunk_cmd = [sys.executable, "src/chunk.py", "--input"] + input_dirs + ["--output", "data/chunks.jsonl"]
     run_command(chunk_cmd, "Step 2: Chunking text from all sources")
-    
-    # Step 4: Generate embeddings and create index
+
+    # Step 4: Split chunks into primary (datasheets, web, accessories) and manual indices
+    print(f"\n{'='*80}")
+    print("Step 3: Splitting chunks into primary and manual indices")
+    print(f"{'='*80}")
+    split_chunks("data/chunks.jsonl", "data/chunks_primary.jsonl", "data/chunks_manuals.jsonl")
+    print("✓ Chunk splitting completed successfully")
+
+    # Step 5a: Embed primary index
     run_command(
-        [sys.executable, "src/embed.py", "--input", "data/chunks.jsonl", "--output", "embeddings/faiss_index/"],
-        "Step 3: Generating embeddings and creating FAISS index"
+        [sys.executable, "src/embed.py", "--input", "data/chunks_primary.jsonl", "--output", "embeddings/primary_index/"],
+        "Step 4a: Building primary index (datasheets, web pages, accessories, FAQ)"
     )
-    
+
+    # Step 5b: Embed manual index
+    run_command(
+        [sys.executable, "src/embed.py", "--input", "data/chunks_manuals.jsonl", "--output", "embeddings/manual_index/"],
+        "Step 4b: Building manual index (user guides, installation manuals)"
+    )
+
+    # Step 6: Build entity-relationship graph from primary index
+    run_command(
+        [sys.executable, "src/entity_graph.py",
+         "--metadata", "embeddings/primary_index/metadata.jsonl",
+         "--output", "embeddings/primary_index/entity_graph.json"],
+        "Step 5: Building entity-relationship graph",
+        allow_fail=True,
+    )
+
     print("\n" + "=" * 80)
     print("Setup Complete!")
     print("=" * 80)
     print(f"\nData sources processed: {', '.join(input_dirs)}")
+    print("Indices: embeddings/primary_index/, embeddings/manual_index/")
     print("\nYou can now use the chatbot:")
     print("  python src/chatbot.py --interactive")
     print("  python src/chatbot.py --query 'Your question here'")

@@ -243,6 +243,72 @@ def rag_content_to_document(content: Dict) -> Optional[Dict]:
     }
 
 
+def accessory_to_document(acc: Dict) -> Optional[Dict]:
+    """Convert an estore_accessories.jsonl record to chunk-compatible format."""
+    parts = []
+    name = acc.get("name", "")
+    pn = acc.get("part_number", "")
+    if name:
+        parts.append(name)
+    if pn:
+        parts.append(f"Part Number: {pn}")
+    if acc.get("category"):
+        parts.append(f"Category: {acc['category']}")
+    if acc.get("subcategory"):
+        parts.append(f"Subcategory: {acc['subcategory']}")
+    if acc.get("price"):
+        parts.append(f"Price: ${acc['price']}")
+
+    if acc.get("compatible_with"):
+        parts.append(f"Compatible with: {acc['compatible_with']}")
+    if acc.get("compatible_chassis"):
+        parts.append(f"Compatible chassis: {acc['compatible_chassis']}")
+    if acc.get("validated_systems"):
+        parts.append(f"Validated systems: {acc['validated_systems']}")
+    if acc.get("validated_chassis"):
+        parts.append(f"Validated chassis: {acc['validated_chassis']}")
+    if acc.get("designed_for"):
+        parts.append(f"Designed for: {acc['designed_for']}")
+
+    if acc.get("dimensions"):
+        parts.append(f"Dimensions: {acc['dimensions']}")
+    if acc.get("warranty"):
+        parts.append(f"Warranty: {acc['warranty']}")
+
+    specs = acc.get("specifications", {})
+    if isinstance(specs, dict) and specs:
+        parts.append("Specifications:")
+        for k, v in specs.items():
+            parts.append(f"  {k}: {v}")
+
+    desc = acc.get("description", "")
+    if desc and len(desc) > 20:
+        parts.append(f"\n{desc}")
+
+    features = acc.get("bullet_features", [])
+    if isinstance(features, list) and features:
+        clean = [f for f in features if len(f) > 5 and not f.startswith("My Account")]
+        if clean:
+            parts.append("Features:\n" + "\n".join(f"- {f}" for f in clean[:15]))
+
+    if acc.get("url"):
+        parts.append(f"Source URL: {acc['url']}")
+
+    text = "\n".join(parts)
+    if len(text) < 80:
+        return None
+
+    safe_pn = re.sub(r'[/\\]', '_', pn)[:60] if pn else "unknown"
+    return {
+        "filename": f"accessory_{safe_pn}.txt",
+        "pages": [{"page_number": 1, "text": text}],
+        "total_pages": 1,
+        "error": None,
+        "source_type": "accessory",
+        "url": acc.get("url", ""),
+    }
+
+
 def process_pages(input_dir: str, output_dir: str):
     """
     Process web page JSONL files and output JSON files compatible with chunk.py.
@@ -323,6 +389,30 @@ def process_pages(input_dir: str, output_dir: str):
             processed += 1
             idx += 1
     
+    # --- Process estore_accessories.jsonl ---
+    acc_file = input_path / ".." / "accessories" / "estore_accessories.jsonl"
+    if not acc_file.exists():
+        acc_file = input_path.parent / "accessories" / "estore_accessories.jsonl"
+    if acc_file.exists():
+        print(f"\nProcessing accessories from {acc_file}...")
+        acc_count = 0
+        for acc in tqdm(list(load_jsonl(acc_file)), desc="Accessories"):
+            doc = accessory_to_document(acc)
+            if doc is None:
+                skipped_short += 1
+                continue
+            text_hash = content_hash(doc['pages'][0]['text'])
+            if text_hash in seen_content_hashes:
+                skipped_dup_content += 1
+                continue
+            seen_content_hashes.add(text_hash)
+            output_file = output_path / f"{doc['filename'].replace('.txt', '.json')}"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(doc, f, indent=2, ensure_ascii=False)
+            processed += 1
+            acc_count += 1
+        print(f"  Accessories processed: {acc_count}")
+
     print(f"\nProcessing complete!")
     print(f"  Processed: {processed} documents")
     print(f"  Skipped (too short after cleaning): {skipped_short}")
