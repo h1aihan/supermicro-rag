@@ -657,11 +657,20 @@ class RoutedIndex:
         """
         manual = self.manual  # snapshot — safe even if loading in background
 
+        if not manual and self._manual_loading and scope in ("manual", "both"):
+            import time as _tw
+            _t0 = _tw.time()
+            while self._manual_loading and (_tw.time() - _t0) < 20:
+                _tw.sleep(0.5)
+            manual = self.manual
+            if manual:
+                print(f"[RoutedIndex] Waited {_tw.time()-_t0:.1f}s for manual index")
+            else:
+                print("[RoutedIndex] Manual index still not ready after wait — falling back to primary")
+
         if scope == "manual":
             if manual:
                 return manual.search_hybrid(query, top_k, **kwargs)
-            if self._manual_loading:
-                print("[RoutedIndex] Manual index still loading — falling back to primary")
             return self.primary.search_hybrid(query, top_k, **kwargs)
 
         results = self.primary.search_hybrid(query, top_k, **kwargs)

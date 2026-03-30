@@ -232,6 +232,7 @@ class RAGQueryProcessor:
         max_per_source: Optional[int] = None,
         source_filter: Optional[str] = None,
         scope: str = "primary",
+        manual_top_k: Optional[int] = None,
     ) -> List[Dict]:
         """
         Retrieve relevant chunks using hybrid search.
@@ -242,15 +243,20 @@ class RAGQueryProcessor:
             max_per_source: If set, cap chunks per source file for diversity
             source_filter: If set, restrict to chunks whose source_file contains this string
             scope: "primary" (default), "manual" (manual only), or "both" (primary + manual)
+            manual_top_k: If set, override default manual_top_k in RoutedIndex
             
         Returns:
             List of chunk dictionaries with similarity scores
         """
         expanded_query = preprocess_query(query)
         
+        extra = {}
+        if manual_top_k is not None:
+            extra["manual_top_k"] = manual_top_k
         results = self.index.search_hybrid(expanded_query, top_k, scope=scope,
                                            max_per_source=max_per_source,
-                                           source_filter=source_filter)
+                                           source_filter=source_filter,
+                                           **extra)
         
         # Convert to list of dicts
         chunks = []
@@ -269,6 +275,13 @@ class RAGQueryProcessor:
         
         return chunks
     
+    _PRICE_PATTERN = re.compile(
+        r'(?:(?:Starting\s+)?Price\s*[:\-]?\s*)?'
+        r'\$[\d,]+\.?\d{0,2}'
+        r'(?:\s*[-~]\s*\$[\d,]+\.?\d{0,2})?',
+        re.IGNORECASE,
+    )
+
     def format_context(self, chunks: List[Dict]) -> str:
         """
         Format retrieved chunks into context string for LLM.
@@ -282,7 +295,8 @@ class RAGQueryProcessor:
         context_parts = []
         for i, chunk in enumerate(chunks, 1):
             header = f"[Source {i}: {chunk['source_file']}]"
-            context_parts.append(f"{header}\n{chunk['text']}\n")
+            text = self._PRICE_PATTERN.sub("", chunk['text'])
+            context_parts.append(f"{header}\n{text}\n")
         
         return "\n".join(context_parts)
 

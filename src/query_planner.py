@@ -505,6 +505,16 @@ def _parse_plan(raw: str, original_query: str) -> QueryPlan:
     elif plan.doc_type_hint == "datasheet":
         plan.search_scope = "primary"
 
+    # Widen scope for queries that need manual-index data (CPU compatibility,
+    # hardware support, troubleshooting) even when the LLM planner chose "datasheet".
+    import re as _re
+    _q = original_query.lower()
+    _compat_kw = _re.compile(
+        r'\b(support|compatible|compatibility|troubleshoot|error|lock.?up|freeze|crash|bios|firmware|memtest)\b'
+    )
+    if _compat_kw.search(_q) and plan.search_scope == "primary":
+        plan.search_scope = "both"
+
     # Safety: ensure at least one retrieval path
     if not plan.use_catalog and not plan.use_rag:
         plan.use_rag = True
@@ -542,7 +552,7 @@ def _fallback_plan(query: str) -> QueryPlan:
         plan.doc_type_hint = "manual"
         plan.search_scope = "manual"
     else:
-        _manual_kw = r'\b(bios|install|configure|setup|troubleshoot|error|firmware|update|flash|recovery|beep\s*code|memtest|jumper|dip\s*switch)\b'
+        _manual_kw = r'\b(bios|install|configure|setup|troubleshoot|error|firmware|update|flash|recovery|beep\s*code|memtest|jumper|dip\s*switch|support\w*\s+.*\bcpu\b|cpu\s+.*\bsupport|compatible|compatibility)\b'
         if re.search(_manual_kw, q):
             plan.search_scope = "both"
 

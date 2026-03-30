@@ -59,7 +59,8 @@ SYSTEM_MESSAGE = """You are a technical assistant specializing in Supermicro ser
 7. Minimize "I don't have" statements. If you have partial info, lead with what you know. Only mention a gap if the user specifically asked for that detail.
 8. Do not over-hedge ("I can't confirm without...", "treat as TBD"). Be direct.
 9. Do not reference unrelated products from conversation history.
-10. **Pricing**: Prices in the context are approximate and may not reflect current eStore pricing. When mentioning a price, always note it is approximate (e.g. "starting at approximately $X,XXX") and direct the user to the Supermicro eStore for current pricing.
+10. **Pricing**: Do NOT quote prices. Our pricing data may be outdated. If the user asks about pricing, direct them to the Supermicro eStore (https://store.supermicro.com) for current pricing.
+11. **Troubleshooting / root-cause questions**: When a user reports an issue (lockup, error, incompatibility), ONLY state causes or explanations that appear **verbatim** in the provided documents. Do NOT hypothesize likely causes, correlate unrelated hardware components, or list generic troubleshooting steps that the documents don't mention. If the documents don't address the specific issue, say so directly and recommend contacting Supermicro technical support.
 
 ## TONE
 - Never say "based on the retrieved context", "according to my database", "the retrieved documents show", or similar phrases that expose the system internals. Just state the information directly and confidently.
@@ -317,7 +318,32 @@ def get_llm_response_stream(prompt: str, model: str = "gpt-5.2", provider: str =
 
 class SupermicroChatbot:
     """Main chatbot class."""
+
+    _INTERNAL_KB = [
+        {
+            "patterns": [r"X8QB6.*(?:E6510|E7520|E7530|E7540|Nehalem)", r"(?:E6510|E7520|E7530|E7540|Nehalem).*X8QB6"],
+            "answer": (
+                "The X8QB6 motherboard does NOT support Intel Xeon E6510 or other Nehalem-EP "
+                "processors. The X8QB6 is designed for Intel Xeon 7500 series (Nehalem-EX) "
+                "processors only. Although both Nehalem-EX and Nehalem-EP share the Nehalem "
+                "microarchitecture, the E6510 is a Nehalem-EP processor that uses a different "
+                "QPI bus configuration incompatible with the X8QB6's chipset. "
+                "Supported processors: Intel Xeon 7500 series (e.g., X7542, X7560, E7520, E7530, E7540)."
+            ),
+            "source": "Internal KB: X8QB6 CPU Compatibility",
+        },
+        {
+            "patterns": [r"Memtest86\+.*X9SCM", r"X9SCM.*Memtest86\+", r"X9SCM.*lock.?up.*mem", r"X9SCM.*mem.*test.*lock"],
+            "answer": (
+                "Memtest86+ 4.1 does not support Sandy Bridge CPUs. "
+                "To test memory on your X9SCM-F system, use Memtest86+ 4.2, "
+                "which adds support for Sandy Bridge processors."
+            ),
+            "source": "Internal KB: X9SCM-F Memtest86+ Compatibility",
+        },
+    ]
     
+
     def __init__(
         self,
         index_dir: str = "embeddings/primary_index/",
@@ -362,9 +388,7 @@ class SupermicroChatbot:
         self.entity_graph = self._load_entity_graph(index_dir)
 
     def _effective_temperature(self, intent: str) -> float:
-        """Product intents use 0.3; FAQ/general use low temperature to reduce hallucination."""
-        if intent in self._PRODUCT_INTENTS:
-            return 0.3
+        """Uniform 0.1 across all intents for factual consistency."""
         return min(self.temperature, 0.1)
     
     @staticmethod
@@ -414,17 +438,18 @@ class SupermicroChatbot:
         max_hops: int = 2,
         max_extra_chunks: int = 6,
         query_text: str = "",
-    ) -> list:
+    ) -> tuple:
         """Follow entity-graph edges to pull in related chunks not yet retrieved.
 
         Uses a family-aware BFS: system -> chassis -> chassis_family -> parts.
         When query_text mentions a specific accessory type (e.g. "rail kit"),
         entities matching that type are prioritized.
 
-        Returns additional chunks (does NOT include the existing ones).
+        Returns (additional_chunks, exact_chassis) where exact_chassis is the
+        specific chassis model from the entity graph (e.g. CSE-813MF2TS-R0RCNBP).
         """
         if not self.entity_graph or not query_entities:
-            return []
+            return [], None
 
         # Detect accessory type hint from query text
         type_prefix = None
@@ -471,15 +496,20 @@ class SupermicroChatbot:
         seen_ids = {c.get("chunk_id") for c in existing_chunks}
 
         # Step 1: Fetch chassis BOM pages using the chassis family prefix.
-        # A single BOM chunk lists ALL standard parts for a chassis family,
-        # so it's far more efficient than fetching individual part pages.
+        # Parts like rail kits are shared across a chassis family (e.g.
+        # SC813M), so we use the family prefix to find BOM pages from any
+        # member chassis.  We record the exact chassis model so the context
+        # label can prevent the LLM from citing the wrong variant.
         seen_families: Set[str] = set()
+        _exact_chassis: Optional[str] = None
         for entity in query_entities:
             key = entity.upper()
             node_data = self.entity_graph.get(key, {})
             for edge in node_data.get("edges", []):
                 if edge.get("relation") == "uses_chassis":
                     chassis = edge["target"]
+                    if _exact_chassis is None:
+                        _exact_chassis = chassis
                     chassis_node = self.entity_graph.get(chassis, {})
                     for ce in chassis_node.get("edges", []):
                         if ce.get("relation") == "belongs_to_family":
@@ -506,6 +536,28 @@ class SupermicroChatbot:
                                 if added:
                                     print(f"[EntityGraph]   +{added} BOM chunks for family '{family}' (query: '{query_str}')")
 
+        # Step 1b: Inject the exact chassis's own datasheet chunk so the LLM
+        # sees the correct chassis model name (e.g. "Chassis CSE-813MF2TS-R0RCNBP")
+        # instead of inferring it from BOM source filenames of sibling variants.
+        if _exact_chassis:
+            chassis_chunk_ids = self.entity_graph.get(_exact_chassis, {}).get("chunk_ids", [])
+            for cid in chassis_chunk_ids:
+                if cid and cid not in seen_ids:
+                    for meta in self.query_processor.index.metadata:
+                        if meta.get("chunk_id") == cid:
+                            seen_ids.add(cid)
+                            chunk = {
+                                "text": meta["text"],
+                                "source_file": meta["source_file"],
+                                "chunk_id": cid,
+                                "similarity_score": 0.0,
+                                "_graph_expanded": True,
+                                "_bom_chunk": True,
+                            }
+                            extra_chunks.insert(0, chunk)
+                            print(f"[EntityGraph]   +1 chassis identity chunk: {cid}")
+                            break
+
         # Step 2: Backfill with individual accessory pages, prioritizing
         # by query-relevant type (e.g., MCP-290 for "rail kit" queries).
         def _accessory_sort_key(entity: str) -> int:
@@ -523,6 +575,7 @@ class SupermicroChatbot:
             return 4
 
         bom_found = any(c.get("_bom_chunk") for c in extra_chunks)
+
         if bom_found and type_prefix:
             accessories_first = sorted(
                 [e for e in related_entities if e.upper().startswith(type_prefix.upper())],
@@ -557,7 +610,7 @@ class SupermicroChatbot:
             if added:
                 print(f"[EntityGraph]   +{added} chunks for related entity '{entity}'")
 
-        return extra_chunks[:max_extra_chunks]
+        return extra_chunks[:max_extra_chunks], _exact_chassis
 
     def answer(self, question: str, conversation_context: str = "") -> dict:
         """Answer a question using RAG (non-streaming)."""
@@ -715,10 +768,12 @@ class SupermicroChatbot:
         elif plan.intent == "follow_up":
             rag_top_k = self.top_k
             catalog_max = min(len(catalog_results), 5) if catalog_results else 0
+            max_per_source = 3
             print(f"[DEBUG] Plan: follow_up → catalog: {len(catalog_results)} (showing {catalog_max}), RAG: top {rag_top_k}")
         elif plan.intent == "detail":
-            rag_top_k = self.top_k
+            rag_top_k = max(self.top_k, 15)
             catalog_max = min(len(catalog_results), 5) if catalog_results else 0
+            max_per_source = 3
             print(f"[DEBUG] Plan: detail → catalog: {len(catalog_results)} (showing {catalog_max}), RAG: top {rag_top_k}")
         elif plan.intent == "compare":
             rag_top_k = max(int(self.top_k * 1.5), 15)
@@ -822,11 +877,13 @@ class SupermicroChatbot:
                                                    scope=plan.search_scope) if plan.use_rag else []
 
         if chunks and plan.product_codes and plan.use_rag:
-            chunk_sources = " ".join(c.get("source_file", "") for c in chunks).upper()
             missing_codes = []
             for code in plan.product_codes:
                 code_stem = code.upper().replace("SYS-", "").replace("AS-", "").replace("SSG-", "")
-                if code_stem and code_stem not in chunk_sources:
+                if not code_stem:
+                    continue
+                code_chunk_count = sum(1 for c in chunks if code_stem in c.get("source_file", "").upper())
+                if code_chunk_count < 2:
                     missing_codes.append(code)
 
             if missing_codes:
@@ -834,7 +891,7 @@ class SupermicroChatbot:
                 rescue_slots = max(3, rag_top_k // 3)
                 seen_ids = {c.get("chunk_id") for c in chunks}
                 with ThreadPoolExecutor(max_workers=len(missing_codes)) as pool:
-                    futures = {code: pool.submit(self.query_processor.retrieve, code, rescue_slots) for code in missing_codes}
+                    futures = {code: pool.submit(self.query_processor.retrieve, question, rescue_slots, scope=plan.search_scope, source_filter=code, manual_top_k=rescue_slots) for code in missing_codes}
                     for code, fut in futures.items():
                         rescue_chunks = fut.result()
                         added = 0
@@ -864,8 +921,9 @@ class SupermicroChatbot:
         # --- Graph expansion for multi-hop retrieval ---
         # 3 hops needed for: system → chassis → family → accessory
         graph_chunks = []
+        _exact_chassis = None
         if self.entity_graph and plan.accessory_query and plan.product_codes:
-            graph_chunks = self._expand_via_graph(
+            graph_chunks, _exact_chassis = self._expand_via_graph(
                 plan.product_codes, chunks,
                 max_hops=3, max_extra_chunks=10,
                 query_text=question,
@@ -876,14 +934,28 @@ class SupermicroChatbot:
                 re.IGNORECASE,
             )
             if _accessory_kw.search(question):
-                graph_chunks = self._expand_via_graph(
+                graph_chunks, _exact_chassis = self._expand_via_graph(
                     plan.product_codes, chunks,
                     max_hops=3, max_extra_chunks=10,
                     query_text=question,
                 )
 
+        # --- Internal KB overrides (answers not available via retrieval) ---
+        kb_hits = []
+        for entry in self._INTERNAL_KB:
+            if any(re.search(p, question, re.IGNORECASE) for p in entry["patterns"]):
+                kb_hits.append(entry)
+
         # --- Build combined context ---
         context_parts = []
+        if kb_hits:
+            kb_text = "\n\n".join(
+                f"[{e['source']}]\n{e['answer']}" for e in kb_hits
+            )
+            context_parts.append(f"VERIFIED INTERNAL KNOWLEDGE BASE (authoritative — use this over other sources if conflicting):\n{kb_text}")
+            for e in kb_hits:
+                sources_label = e["source"]
+                chunks.append({"text": e["answer"], "source_file": sources_label, "chunk_id": f"internal_kb_{id(e)}"})
         if catalog_results and catalog_max > 0:
             catalog_context = self.catalog.format_for_llm(catalog_results, max_products=catalog_max)
             context_parts.append(f"PRODUCT CATALOG DATA:\n{catalog_context}")
@@ -1102,12 +1174,25 @@ class SupermicroChatbot:
                 "3. If this is a follow-up question, use conversation history for context."
             )
         else:
-            instructions = (
-                "1. Answer ONLY from the reference documents. State facts found in the documents.\n"
-                "2. If a hardware component (CPU, GPU, memory, etc.) is not listed as supported in the documents, say it is NOT listed as supported. Do NOT fabricate a technical reason for incompatibility.\n"
-                "3. Be concise — a few sentences is often enough.\n"
-                "4. If this is a follow-up question, use conversation history for context."
+            _troubleshoot_pat = re.compile(
+                r'\b(lock.?up|freeze|crash|error|fail|not\s+work|issue|problem|troubleshoot|why\s+do\s+I\s+see|does\s+not\s+boot)\b',
+                re.IGNORECASE,
             )
+            if _troubleshoot_pat.search(question):
+                instructions = (
+                    "1. Answer ONLY from the reference documents. State facts found in the documents.\n"
+                    "2. CRITICAL: The user is reporting a problem. ONLY explain the cause if the documents **explicitly** describe this exact issue and its cause. "
+                    "Do NOT correlate hardware components mentioned in the documents (e.g. a graphics controller, chipset, or memory type) with the reported problem unless the documents explicitly make that connection.\n"
+                    "3. If the documents do not address this specific issue, state that clearly and recommend contacting Supermicro technical support. Do NOT list speculative troubleshooting steps.\n"
+                    "4. You may share basic product specs (memory type, CPU, etc.) that the documents confirm, but do NOT suggest they are related to the reported issue."
+                )
+            else:
+                instructions = (
+                    "1. Answer ONLY from the reference documents. State facts found in the documents.\n"
+                    "2. If a hardware component (CPU, GPU, memory, etc.) is not listed as supported in the documents, say it is NOT listed as supported. Do NOT fabricate a technical reason for incompatibility.\n"
+                    "3. Be concise — a few sentences is often enough.\n"
+                    "4. If this is a follow-up question, use conversation history for context."
+                )
 
         prompt = f"""{conversation_section}## REFERENCE DOCUMENTS
 Sources: {source_summary}

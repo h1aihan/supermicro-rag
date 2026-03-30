@@ -214,14 +214,11 @@ docker run -d --name supermicro-rag -p 8000:8000 \
   -e LLM_PROVIDER=anthropic \
   -e ANTHROPIC_MODEL=claude-sonnet-4-5 \
   -e PLANNER_MODEL=claude-haiku-4-5 \
-  -e LLM_TEMPERATURE=0.5 \
+  -e LLM_TEMPERATURE=0.1 \
   -e LLM_TOP_P=1.0 \
-  -e INDEX_DIR=/app/embeddings/primary_index \
-  -e MANUAL_INDEX_DIR=/app/embeddings/manual_index \
-  -e PRODUCTS_FILE=/app/data/pages/products.jsonl \
   -e TOP_K=15 \
   -e FAISS_MMAP=1 \
-  -e ENABLE_RERANKING=1 \
+  -e ENABLE_RERANKING=0 \
   $ECR_IMAGE
 ```
 

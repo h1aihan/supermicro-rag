@@ -109,11 +109,26 @@ class ProductCatalog:
         if "microcloud" in name_lower or "micro cloud" in name_lower:
             tags.add("MicroCloud")
         
-        # GPU support
+        # GPU support — parse max count and model list separately
         gpu_field = product.get("gpu", "")
         if gpu_field and "supported" in gpu_field.lower():
             tags.add("GPU-capable")
-        
+
+        gpu_max_count = 0
+        gpu_models = []
+        if gpu_field:
+            m_count = re.search(r'Max\s+Number\s+of\s+GPU\s+Support\s+(\d+)', gpu_field, re.IGNORECASE)
+            if not m_count:
+                m_count = re.search(r'Up\s+to\s+(\d+)\s+(?:Double-Wide|double-width|single-width|GPU)', gpu_field, re.IGNORECASE)
+            if m_count:
+                gpu_max_count = int(m_count.group(1))
+            model_hits = re.findall(r'NVIDIA\s+PCIe:\s*([^,\n]+)', gpu_field)
+            gpu_models = [m.strip() for m in model_hits if m.strip()]
+        if gpu_max_count:
+            tags.add("GPU-capable")
+        product["gpu_max_count"] = gpu_max_count
+        product["gpu_models"] = gpu_models
+
         product["tags"] = tags
 
         # --- Parsed spec fields for structured filtering ---
@@ -384,7 +399,7 @@ class ProductCatalog:
             sku = p.get("sku", "")
             name = p.get("name", "")
             tags = ", ".join(sorted(p.get("tags", set()))) or p.get("category", "")
-            price = p.get("price_range", "")
+            # price intentionally excluded from LLM context
             
             line = f"{i}. **{sku or name}**"
             if sku:
@@ -399,15 +414,21 @@ class ProductCatalog:
                     cpu_detail += f" (Supports: {', '.join(p['cpu_series'])})"
                 details.append(f"CPU: {cpu_detail}")
             if p.get("gpu"):
-                details.append(f"GPU: {p['gpu']}")
+                gpu_count = p.get("gpu_max_count", 0)
+                if gpu_count:
+                    details.append(f"GPU: Max {gpu_count} GPUs")
+                elif p.get("gpu_models"):
+                    details.append("GPU: Yes (see datasheet for max GPU count)")
+                else:
+                    details.append(f"GPU: {p['gpu']}")
             if p.get("memory"):
                 details.append(f"Memory: {p['memory']}")
             if p.get("storage"):
                 details.append(f"Storage: {p['storage']}")
             if p.get("chassis"):
                 details.append(f"Chassis: {p['chassis']}")
-            if price:
-                details.append(f"Price: {price}")
+            # Price data omitted — crawled prices go stale quickly.
+            # Users are directed to the eStore for current pricing.
             
             if details:
                 line += "\n   " + " | ".join(details)

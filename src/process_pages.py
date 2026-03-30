@@ -140,9 +140,8 @@ def product_to_document(product: Dict) -> Dict:
         parts.append("Specifications:")
         parts.extend(specs)
     
-    # Price if available
-    if product.get('price_range'):
-        parts.append(f"Price: {product['price_range']}")
+    # Price intentionally omitted — crawled prices go stale quickly.
+    # Users are directed to the eStore for current pricing.
     
     # Source URL
     if product.get('url'):
