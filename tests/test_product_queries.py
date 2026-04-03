@@ -717,16 +717,28 @@ FOLLOWUP_TEST_QUERIES = [
 def get_chatbot(model_override=None):
     """Lazy init chatbot. model_override replaces the main LLM model (e.g. 'claude-sonnet-4-5' for cheaper testing)."""
     from src.chatbot import SupermicroChatbot
-    index_dir = os.getenv("INDEX_DIR", "embeddings/faiss_index/")
+    from src.embed import get_qdrant_client
+
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
+    primary_collection = os.getenv("QDRANT_COLLECTION_PRIMARY", "supermicro_primary")
+    manual_collection = os.getenv("QDRANT_COLLECTION_MANUAL", "supermicro_manual")
+
     provider = os.getenv("LLM_PROVIDER", "openai")
     model = model_override or os.getenv("LLM_MODEL", "gpt-5.2")
     if model_override and provider == "anthropic":
         os.environ["ANTHROPIC_MODEL"] = model_override
+
+    client = get_qdrant_client(qdrant_url, qdrant_api_key)
     return SupermicroChatbot(
-        index_dir=index_dir,
+        qdrant_client=client,
+        primary_collection=primary_collection,
+        manual_collection=manual_collection,
         llm_model=model,
         llm_provider=provider,
         top_k=int(os.getenv("TOP_K", "10")),
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.5")),
+        top_p=float(os.getenv("LLM_TOP_P", "1.0")),
     )
 
 

@@ -1,0 +1,26 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    volumes:
+      - ./data/pages:/app/data/pages:ro
+      - ./embeddings/primary_index/entity_graph.json:/app/embeddings/primary_index/entity_graph.json:ro
+    depends_on:
+      - qdrant
+
+volumes:
+  qdrant_data:

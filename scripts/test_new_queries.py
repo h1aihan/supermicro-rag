@@ -6,8 +6,16 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
 from src.chatbot import SupermicroChatbot
+from src.embed import get_qdrant_client
 
+client = get_qdrant_client(
+    os.getenv("QDRANT_URL", "http://localhost:6333"),
+    os.getenv("QDRANT_API_KEY"),
+)
 bot = SupermicroChatbot(
+    qdrant_client=client,
+    primary_collection=os.getenv("QDRANT_COLLECTION_PRIMARY", "supermicro_primary"),
+    manual_collection=os.getenv("QDRANT_COLLECTION_MANUAL", "supermicro_manual"),
     llm_provider=os.getenv("LLM_PROVIDER", "anthropic"),
     llm_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
     temperature=float(os.getenv("LLM_TEMPERATURE", "0.5")),

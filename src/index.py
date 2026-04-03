@@ -1,213 +1,262 @@
 #!/usr/bin/env python3
 """
-Load and manage FAISS vector index + BM25 keyword index for hybrid search.
+Hybrid search index backed by Qdrant vector database.
+
+Each HybridIndex connects to a single Qdrant collection containing:
+  - "dense" named vector  (sentence-transformer embeddings, cosine)
+  - "sparse" named vector (BM25-weighted token hashes)
+  - Payload fields: chunk_id, source_file, chunk_index, text, total_chunks
+
+RoutedIndex wraps a primary + optional manual collection and routes
+queries by scope ("primary", "manual", "both").
 """
 
-import json
 import os
 import re
-import pickle
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import faiss
 from sentence_transformers import SentenceTransformer
 
+try:
+    from src.embed import (
+        build_query_sparse_vector,
+        token_to_index,
+        tokenize_for_bm25,
+    )
+except ImportError:
+    from embed import (
+        build_query_sparse_vector,
+        token_to_index,
+        tokenize_for_bm25,
+    )
 
-def tokenize_for_bm25(text: str) -> List[str]:
-    """
-    Tokenizer for BM25 optimized for Supermicro product codes.
-    
-    For product codes like SYS-521GE-TNRT, generates both:
-    - The full hyphenated token: sys-521ge-tnrt
-    - Individual parts: sys, 521ge, tnrt
-    
-    This allows queries like "521GE" to match "SYS-521GE-TNRT".
-    """
-    text = text.lower()
-    
-    # Find all word tokens (with hyphens)
-    hyphenated_tokens = re.findall(r'\b[\w]+-[\w-]+\b', text)
-    
-    # Find simple word tokens
-    simple_tokens = re.findall(r'\b\w+\b', text)
-    
-    # Combine: keep hyphenated tokens AND their parts
-    tokens = []
-    for token in hyphenated_tokens:
-        tokens.append(token)  # Keep full token: sys-521ge-tnrt
-        parts = token.split('-')
-        tokens.extend(parts)  # Add parts: sys, 521ge, tnrt
-    
-    # Add simple tokens
-    tokens.extend(simple_tokens)
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_tokens = []
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            unique_tokens.append(t)
-    
-    return unique_tokens
 
+# ── Qdrant payload proxy ─────────────────────────────────────────────────
+
+class _QdrantPayloadProxy:
+    """List-like facade over a Qdrant collection's payloads.
+
+    Supports ``len()``, integer indexing (by point ID), and iteration
+    (scroll in ID order) so that existing code using ``self.metadata``
+    keeps working without loading everything into memory.
+    """
+
+    def __init__(self, client, collection_name: str):
+        self._client = client
+        self._collection = collection_name
+        self._count: Optional[int] = None
+
+    def __len__(self) -> int:
+        if self._count is None:
+            info = self._client.get_collection(self._collection)
+            self._count = info.points_count or 0
+        return self._count
+
+    def __getitem__(self, idx: int) -> Dict:
+        if not isinstance(idx, int):
+            raise TypeError(f"index must be int, got {type(idx)}")
+        pts = self._client.retrieve(
+            collection_name=self._collection,
+            ids=[idx],
+            with_payload=True,
+            with_vectors=False,
+        )
+        if not pts:
+            raise IndexError(f"Point {idx} not found in '{self._collection}'")
+        return pts[0].payload
+
+    def __iter__(self):
+        offset = None
+        while True:
+            pts, offset = self._client.scroll(
+                collection_name=self._collection,
+                limit=500,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in pts:
+                yield p.payload
+            if offset is None:
+                break
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _normalize_rows(v: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    return v / norms
+
+
+_FILENAME_STOPWORDS = frozenset({
+    'the', 'is', 'at', 'which', 'on', 'for', 'and', 'or', 'to', 'in',
+    'of', 'with', 'what', 'how', 'can', 'do', 'does', 'are', 'was',
+    'be', 'it', 'its', 'an', 'as', 'by', 'from', 'that', 'this',
+    'my', 'me', 'we', 'you', 'your', 'their', 'our', 'into', 'about',
+    'please', 'compare', 'suggest', 'recommend', 'show', 'tell',
+    'give', 'list', 'between', 'vs', 'versus', 'than', 'should',
+    'would', 'could', 'will', 'need', 'want', 'like', 'have', 'has',
+    'pdf', 'datasheet', 'spec', 'specs', 'specification', 'specifications',
+    'supermicro', 'server', 'servers', 'system', 'systems', 'series',
+    'rackmount', 'product', 'products', 'page', 'web', 'txt',
+})
+
+
+# ── HybridIndex ──────────────────────────────────────────────────────────
 
 class HybridIndex:
+    """Hybrid search index combining dense (semantic) and sparse (keyword)
+    vectors stored in a single Qdrant collection.
+
+    Uses Reciprocal Rank Fusion (RRF) with adaptive weighting to combine
+    semantic, keyword, and filename-matching channels.
     """
-    Hybrid search index combining FAISS (semantic) and BM25 (keyword) search.
-    Uses Reciprocal Rank Fusion (RRF) to combine results.
-    """
-    
-    def __init__(self, index_dir: str, model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-                 shared_model=None):
-        """
-        Initialize the hybrid index.
-        
-        Args:
-            index_dir: Directory containing FAISS index, BM25 index, and metadata
-            model_name: Name of the sentence transformer model
-            shared_model: Pre-loaded SentenceTransformer to reuse (saves memory)
-        """
-        self.index_dir = Path(index_dir)
+
+    def __init__(
+        self,
+        collection_name: str,
+        qdrant_client,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        shared_model: Optional[SentenceTransformer] = None,
+    ):
+        self.client = qdrant_client
+        self.collection = collection_name
         self.model_name = model_name
-        self.model = None
-        self.faiss_index = None
-        self.bm25 = None
-        self.metadata = []
-        self._shared_model = shared_model
-        
-        self._load_faiss_index()
-        self._load_bm25_index()
-        self._load_metadata()
-        self._build_filename_index()
-        self._load_model()
+
+        info = self.client.get_collection(collection_name)
+        self._point_count = info.points_count or 0
+        print(f"Connected to Qdrant collection '{collection_name}': "
+              f"{self._point_count:,} points")
+
+        if shared_model is not None:
+            self.model = shared_model
+            print("Reusing shared embedding model")
+        else:
+            print(f"Loading embedding model: {model_name}...")
+            self.model = SentenceTransformer(model_name)
+
+        self.metadata = _QdrantPayloadProxy(self.client, self.collection)
+
         self._build_faq_question_bank()
-    
-    def _load_faiss_index(self):
-        """Load FAISS index from disk."""
-        index_file = self.index_dir / "faiss.index"
-        if not index_file.exists():
-            raise FileNotFoundError(f"FAISS index not found at {index_file}")
 
-        use_mmap = (os.getenv("FAISS_MMAP", "1").strip() != "0")
-        io_flags = faiss.IO_FLAG_MMAP if use_mmap else 0
-        self.faiss_index = faiss.read_index(str(index_file), io_flags)
-        print(f"Loaded FAISS index with {self.faiss_index.ntotal} vectors")
-    
-    def _load_bm25_index(self):
-        """Load BM25 index from disk."""
-        bm25_file = self.index_dir / "bm25.pkl"
-        if not bm25_file.exists():
-            print(f"Warning: BM25 index not found at {bm25_file}, keyword search disabled")
-            self.bm25 = None
-            return
-        
-        with open(bm25_file, 'rb') as f:
-            data = pickle.load(f)
-            self.bm25 = data['bm25']
-        print(f"Loaded BM25 index for keyword search")
-    
-    def _load_metadata(self):
-        """Load chunk metadata from JSONL file."""
-        metadata_file = self.index_dir / "metadata.jsonl"
-        if not metadata_file.exists():
-            raise FileNotFoundError(f"Metadata file not found at {metadata_file}")
-        
-        with open(metadata_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    self.metadata.append(json.loads(line))
-        
-        print(f"Loaded metadata for {len(self.metadata)} chunks")
+    # ── Source-filter helper ──────────────────────────────────────────
 
-    def _build_filename_index(self):
-        """Build an inverted index mapping filename tokens to chunk indices."""
-        self._filename_index: Dict[str, set] = defaultdict(set)
-        for idx, meta in enumerate(self.metadata):
-            source = meta.get('source_file', '').lower()
-            tokens = set(re.findall(r'\b\w{2,}\b', source.replace('_', ' ').replace('-', ' ')))
-            for token in tokens:
-                self._filename_index[token].add(idx)
-        print(f"Built filename index: {len(self._filename_index)} unique tokens across {len(self.metadata)} chunks")
+    def _make_source_filter(self, source_filter: str):
+        """Convert a source_filter substring into a Qdrant Filter.
 
-    def _load_model(self):
-        """Load sentence transformer model (or reuse shared instance)."""
-        if self._shared_model is not None:
-            self.model = self._shared_model
-            print(f"Reusing shared embedding model")
-            return
-        print(f"Loading embedding model: {self.model_name}...")
-        self.model = SentenceTransformer(self.model_name)
+        Uses the full-text index on ``source_file_text`` to approximate
+        the legacy ``source_filter in source_file`` behaviour.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchText
+
+        search_text = (
+            source_filter
+            .replace(":", " ")
+            .replace("-", " ")
+            .replace("_", " ")
+            .strip()
+        )
+        if not search_text:
+            return None
+        return Filter(
+            must=[FieldCondition(
+                key="source_file_text",
+                match=MatchText(text=search_text),
+            )]
+        )
+
+    def _check_filter_has_results(self, qf) -> bool:
+        if qf is None:
+            return True
+        count = self.client.count(
+            collection_name=self.collection,
+            count_filter=qf,
+            exact=False,
+        )
+        return count.count > 0
+
+    # ── FAQ question bank ─────────────────────────────────────────────
 
     def _build_faq_question_bank(self):
-        """Build a lightweight vector bank of FAQ question titles for direct
-        user-question → FAQ-question matching.
+        """Build a lightweight in-memory vector bank of FAQ question titles."""
+        from qdrant_client.models import FieldCondition, Filter, MatchText
 
-        Scans metadata for FAQ chunks, extracts the question text from each
-        chunk, deduplicates, embeds the unique questions, and stores them
-        alongside a mapping from question index → chunk indices.
-        """
+        faq_filter = Filter(must=[
+            FieldCondition(
+                key="source_file_text",
+                match=MatchText(text="FAQ"),
+            )
+        ])
+
+        faq_points = []
+        offset = None
+        while True:
+            pts, offset = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=faq_filter,
+                limit=500,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            faq_points.extend(pts)
+            if offset is None:
+                break
+
         faq_questions: Dict[str, List[int]] = {}
-
-        for idx, meta in enumerate(self.metadata):
-            source = meta.get('source_file', '')
-            if 'FAQ:' not in source:
+        for point in faq_points:
+            meta = point.payload
+            source = meta.get("source_file", "")
+            if "FAQ:" not in source:
                 continue
 
-            text = meta.get('text', '')
+            text = meta.get("text", "")
             match = re.search(r'Q:\s*(.+?)(?:\n|$)', text)
             if match:
                 question = match.group(1).strip()
             else:
-                q = source.replace('web_page_', '').replace('.txt', '')
-                q = re.sub(r'^FAQ:_?', '', q).replace('_', ' ').strip()
+                q = source.replace("web_page_", "").replace(".txt", "")
+                q = re.sub(r'^FAQ:_?', '', q).replace("_", " ").strip()
                 if not q:
                     continue
                 question = q
 
             if question not in faq_questions:
                 faq_questions[question] = []
-            faq_questions[question].append(idx)
+            faq_questions[question].append(point.id)
 
         if not faq_questions:
             self._faq_questions: List[str] = []
             self._faq_embeddings: Optional[np.ndarray] = None
             self._faq_chunk_map: Dict[int, List[int]] = {}
-            print("[FAQ Bank] No FAQ entries found in metadata")
+            print("[FAQ Bank] No FAQ entries found")
             return
 
         self._faq_questions = list(faq_questions.keys())
-        self._faq_chunk_map = {i: faq_questions[q]
-                               for i, q in enumerate(self._faq_questions)}
+        self._faq_chunk_map = {
+            i: faq_questions[q] for i, q in enumerate(self._faq_questions)
+        }
 
         embeddings = self.model.encode(self._faq_questions)
-        embeddings = embeddings.astype('float32')
-        faiss.normalize_L2(embeddings)
-        self._faq_embeddings = embeddings
+        self._faq_embeddings = _normalize_rows(embeddings.astype("float32"))
 
         total_chunks = sum(len(v) for v in self._faq_chunk_map.values())
-        print(f"[FAQ Bank] Built question bank: {len(self._faq_questions)} questions, "
-              f"{total_chunks} chunks")
+        print(f"[FAQ Bank] Built question bank: {len(self._faq_questions)} "
+              f"questions, {total_chunks} chunks")
 
     def search_faq_questions(
-        self,
-        query: str,
-        top_k: int = 5,
+        self, query: str, top_k: int = 5,
     ) -> List[Tuple[int, str, float, List[int]]]:
-        """Match a user query against FAQ question titles via cosine similarity.
-
-        Returns:
-            List of (question_index, question_text, score, chunk_indices) tuples,
-            sorted by descending similarity.
-        """
+        """Match a user query against FAQ question titles via cosine similarity."""
         if self._faq_embeddings is None or not self._faq_questions:
             return []
 
-        query_emb = self.model.encode([query]).astype('float32')
-        faiss.normalize_L2(query_emb)
-
+        query_emb = _normalize_rows(
+            self.model.encode([query]).astype("float32")
+        )
         scores = np.dot(self._faq_embeddings, query_emb.T).flatten()
         top_indices = np.argsort(scores)[::-1][:top_k]
 
@@ -221,130 +270,156 @@ class HybridIndex:
             ))
         return results
 
-    def search_semantic(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
-        """
-        Semantic search using FAISS.
-        
-        Returns:
-            List of (index, score) tuples
-        """
-        query_embedding = self.model.encode([query])
-        faiss.normalize_L2(query_embedding)
-        scores, indices = self.faiss_index.search(query_embedding.astype('float32'), top_k)
-        
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx >= 0 and idx < len(self.metadata):
-                results.append((int(idx), float(score)))
-        return results
-    
-    def search_keyword(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
-        """
-        Keyword search using BM25.
-        
-        Returns:
-            List of (index, score) tuples
-        """
-        if self.bm25 is None:
-            return []
-        
+    # ── Chunk lookup ──────────────────────────────────────────────────
+
+    def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict]:
+        """Retrieve a single chunk payload by its ``chunk_id`` field."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        pts, _ = self.client.scroll(
+            collection_name=self.collection,
+            scroll_filter=Filter(must=[
+                FieldCondition(
+                    key="chunk_id",
+                    match=MatchValue(value=chunk_id),
+                )
+            ]),
+            limit=1,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return pts[0].payload if pts else None
+
+    def _batch_get_payloads(self, point_ids: List[int]) -> Dict[int, Dict]:
+        """Fetch payloads for a batch of point IDs."""
+        if not point_ids:
+            return {}
+        pts = self.client.retrieve(
+            collection_name=self.collection,
+            ids=point_ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return {p.id: p.payload for p in pts}
+
+    # ── Individual search channels ────────────────────────────────────
+
+    def search_semantic(
+        self, query: str, top_k: int = 20, qdrant_filter=None,
+    ) -> List[Tuple[int, float]]:
+        """Dense vector (semantic) search via Qdrant."""
+        query_emb = self.model.encode([query]).astype("float32")
+
+        results = self.client.query_points(
+            collection_name=self.collection,
+            query=query_emb[0].tolist(),
+            using="dense",
+            limit=top_k,
+            query_filter=qdrant_filter,
+            with_payload=False,
+        )
+        return [(p.id, p.score) for p in results.points]
+
+    def search_keyword(
+        self, query: str, top_k: int = 20, qdrant_filter=None,
+    ) -> List[Tuple[int, float]]:
+        """Sparse vector (BM25-like keyword) search via Qdrant."""
+        from qdrant_client.models import SparseVector
+
         tokens = tokenize_for_bm25(query)
-        scores = self.bm25.get_scores(tokens)
-        
-        # Get top-k indices
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        
-        results = []
-        for idx in top_indices:
-            if scores[idx] > 0:  # Only include non-zero scores
-                results.append((int(idx), float(scores[idx])))
-        return results
+        if not tokens:
+            return []
+        s_idx, s_val = build_query_sparse_vector(tokens)
+        if not s_idx:
+            return []
 
-    def search_by_filename(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
-        """
-        Retrieve chunks whose source filename tokens match the query terms.
+        results = self.client.query_points(
+            collection_name=self.collection,
+            query=SparseVector(indices=s_idx, values=s_val),
+            using="sparse",
+            limit=top_k,
+            query_filter=qdrant_filter,
+            with_payload=False,
+        )
+        return [(p.id, p.score) for p in results.points]
 
-        Returns:
-            List of (index, match_count) tuples, sorted by descending match count.
-        """
-        _STOPWORDS = {
-            'the', 'is', 'at', 'which', 'on', 'for', 'and', 'or', 'to', 'in',
-            'of', 'with', 'what', 'how', 'can', 'do', 'does', 'are', 'was',
-            'be', 'it', 'its', 'an', 'as', 'by', 'from', 'that', 'this',
-            'my', 'me', 'we', 'you', 'your', 'their', 'our', 'into', 'about',
-            'please', 'compare', 'suggest', 'recommend', 'show', 'tell',
-            'give', 'list', 'between', 'vs', 'versus', 'than', 'should',
-            'would', 'could', 'will', 'need', 'want', 'like', 'have', 'has',
-            'pdf', 'datasheet', 'spec', 'specs', 'specification', 'specifications',
-            'supermicro', 'server', 'servers', 'system', 'systems', 'series',
-            'rackmount', 'product', 'products', 'page', 'web', 'txt',
-        }
-        raw_tokens = re.findall(r'\b\w{2,}\b', query.lower().replace('-', ' ').replace('_', ' '))
+    def search_by_filename(
+        self, query: str, top_k: int = 20, qdrant_filter=None,
+    ) -> List[Tuple[int, float]]:
+        """Retrieve chunks whose source-file tokens match query terms."""
+        from qdrant_client.models import FieldCondition, Filter, MatchText
+
+        raw_tokens = re.findall(
+            r'\b\w{2,}\b',
+            query.lower().replace('-', ' ').replace('_', ' '),
+        )
         terms = list(dict.fromkeys(
-            t for t in raw_tokens if len(t) >= 2 and t not in _STOPWORDS
+            t for t in raw_tokens if len(t) >= 2 and t not in _FILENAME_STOPWORDS
         ))
         if not terms:
             return []
 
-        chunk_scores: Dict[int, int] = defaultdict(int)
-        for term in terms:
-            for idx in self._filename_index.get(term, set()):
-                chunk_scores[idx] += 1
+        should_clauses = [
+            FieldCondition(key="source_file_text", match=MatchText(text=t))
+            for t in terms
+        ]
+        fn_filter = Filter(should=should_clauses)
+
+        if qdrant_filter is not None:
+            fn_filter = Filter(
+                must=[qdrant_filter, fn_filter],
+            )
+
+        pts, _ = self.client.scroll(
+            collection_name=self.collection,
+            scroll_filter=fn_filter,
+            limit=min(top_k * 10, 500),
+            with_payload=["source_file"],
+            with_vectors=False,
+        )
+
+        chunk_scores: Dict[int, int] = {}
+        for p in pts:
+            source = p.payload.get("source_file", "").lower()
+            src_tokens = set(re.findall(
+                r'\b\w{2,}\b',
+                source.replace('_', ' ').replace('-', ' '),
+            ))
+            match_count = sum(1 for t in terms if t in src_tokens)
+            if match_count > 0:
+                chunk_scores[p.id] = match_count
 
         ranked = sorted(chunk_scores.items(), key=lambda x: x[1], reverse=True)
         return [(idx, float(score)) for idx, score in ranked[:top_k]]
 
+    # ── Query type detection ──────────────────────────────────────────
+
     def _is_product_code_query(self, query: str) -> bool:
-        """
-        Detect if query looks like a product code/identifier.
-        
-        Product codes typically:
-        - Are short (1-3 words)
-        - Contain alphanumeric patterns with numbers
-        - Match patterns like "521GE", "SYS-521GE", "X13DEI", etc.
-        """
         words = query.strip().split()
-        
-        # Short queries (1-3 words) with alphanumeric codes
         if len(words) <= 3:
             for word in words:
-                # Check if word looks like a product code (has both letters and numbers)
                 has_letter = any(c.isalpha() for c in word)
                 has_digit = any(c.isdigit() for c in word)
                 if has_letter and has_digit:
                     return True
-                # Also check for known prefixes
-                if word.upper().startswith(('SYS-', 'AS-', 'SSG-', 'SBI-', 'AOC-', 'X1', 'H1')):
+                if word.upper().startswith(
+                    ('SYS-', 'AS-', 'SSG-', 'SBI-', 'AOC-', 'X1', 'H1')
+                ):
                     return True
         return False
-    
+
     def _is_keyword_heavy_query(self, query: str) -> bool:
-        """
-        Detect queries that should heavily favor BM25 keyword search.
-        
-        Used for queries where exact term matching matters more than
-        semantic similarity (e.g., specific product names, short keyword queries).
-        """
-        words = query.strip().split()
-        
-        # Very short queries (1-2 words) are usually keyword lookups
-        if len(words) <= 2:
-            return True
-        
-        return False
-    
-    # Pre-compiled regexes for source-type classification
+        return len(query.strip().split()) <= 2
+
+    # ── Source-type boosting ──────────────────────────────────────────
+
     _RE_MANUAL = re.compile(r'^MNL-', re.IGNORECASE)
-    _RE_GUIDE = re.compile(r'[Uu]ser[_\s]?[Gg]uide|^QRG-|^BMC_IPMI|^IPMI', re.IGNORECASE)
+    _RE_GUIDE = re.compile(
+        r'[Uu]ser[_\s]?[Gg]uide|^QRG-|^BMC_IPMI|^IPMI', re.IGNORECASE,
+    )
     _RE_CHASSIS = re.compile(r'^(?:SC\d|CSE-)', re.IGNORECASE)
 
     def _source_type_boost(self, source_file: str) -> float:
-        """Return a score multiplier based on document type.
-
-        Datasheets and web pages are concise, high-signal content.
-        Manuals are verbose and numerous — dampen them so they don't
-        drown out datasheets in retrieval.
-        """
         if source_file.startswith('web_page_FAQ'):
             return 1.4
         if source_file.startswith('accessory_'):
@@ -361,331 +436,305 @@ class HybridIndex:
             return 1.15
         return 1.0
 
+    # ── BM25 query expansion ─────────────────────────────────────────
+
     def _expand_query_for_bm25(self, query: str) -> str:
-        """
-        Expand query with stemmed variants for better BM25 matching.
-        
-        Uses general-purpose suffix rules so ANY query benefits 
-        (e.g., "servers"→"server", "skus"→"sku", "golden"→"gold").
-        No hardcoded term lists needed.
-        """
         words = query.lower().split()
-        expansions = set()
-        
+        expansions: set = set()
+
         for word in words:
-            # Strip common English suffixes to create stem variants
-            # Plural → singular
             if word.endswith('ies') and len(word) > 4:
-                expansions.add(word[:-3] + 'y')  # categories → category
+                expansions.add(word[:-3] + 'y')
             elif word.endswith('ses') and len(word) > 4:
-                expansions.add(word[:-2])  # processes → process
+                expansions.add(word[:-2])
             elif word.endswith('es') and len(word) > 3:
-                expansions.add(word[:-2])  # switches → switch
-                expansions.add(word[:-1])  # also try just -s removed
+                expansions.add(word[:-2])
+                expansions.add(word[:-1])
             elif word.endswith('s') and not word.endswith('ss') and len(word) > 3:
-                expansions.add(word[:-1])  # skus → sku, servers → server
-            
-            # -en suffix → base (golden → gold)  
+                expansions.add(word[:-1])
             if word.endswith('en') and len(word) > 4:
-                expansions.add(word[:-2])  # golden → gold
-            
-            # -ing suffix → base
+                expansions.add(word[:-2])
             if word.endswith('ing') and len(word) > 5:
-                expansions.add(word[:-3])  # computing → comput
-                expansions.add(word[:-3] + 'e')  # configuring → configure
-            
-            # -ed suffix → base  
+                expansions.add(word[:-3])
+                expansions.add(word[:-3] + 'e')
             if word.endswith('ed') and len(word) > 4:
-                expansions.add(word[:-2])  # configured → configur
-                expansions.add(word[:-1])  # also try just -d removed
-        
-        # Remove any expansions that are already in the query
+                expansions.add(word[:-2])
+                expansions.add(word[:-1])
+
         new_terms = expansions - set(words)
-        # Remove very short stems (likely noise)
         new_terms = {t for t in new_terms if len(t) > 2}
-        
         if new_terms:
             return query + ' ' + ' '.join(new_terms)
         return query
-    
+
+    # ── Hybrid search (RRF fusion) ───────────────────────────────────
+
     def search_hybrid(
-        self, 
-        query: str, 
+        self,
+        query: str,
         top_k: int = 10,
-        semantic_weight: float = None,  # None = auto-detect
-        keyword_weight: float = None,   # None = auto-detect
+        semantic_weight: float = None,
+        keyword_weight: float = None,
         rrf_k: int = 60,
         max_per_source: Optional[int] = None,
         source_filter: Optional[str] = None,
     ) -> List[Tuple[Dict, float]]:
-        """
-        Hybrid search combining semantic and keyword search using Reciprocal Rank Fusion.
-        
-        Uses adaptive weighting based on query type:
-        - Product code queries (e.g., "521GE"): 80% BM25, 20% semantic
-        - Keyword-heavy queries (e.g., "gold series"): 75% BM25, 25% semantic
-        - Natural language queries: 50% BM25, 50% semantic
-        
-        Args:
-            query: Search query
-            top_k: Number of results to return
-            semantic_weight: Weight for semantic search (None = auto-detect)
-            keyword_weight: Weight for keyword search (None = auto-detect)
-            rrf_k: RRF constant (higher = more weight to lower-ranked items)
-            source_filter: If set, only include chunks whose source_file contains this string
-            
-        Returns:
-            List of (chunk_dict, score) tuples
-        """
-        allowed_indices = None
-        if source_filter:
-            allowed_indices = {i for i, m in enumerate(self.metadata)
-                               if source_filter in m.get('source_file', '')}
-            if not allowed_indices:
-                print(f"[DEBUG] source_filter='{source_filter}' matched 0 chunks, falling back to unfiltered")
-                allowed_indices = None
+        """Hybrid search combining semantic + keyword + filename channels
+        via Reciprocal Rank Fusion with adaptive weighting.
 
-        # Auto-detect weights based on query type
+        Returns list of ``(payload_dict, rrf_score)`` tuples.
+        """
+        # Build Qdrant filter from source_filter string
+        qdrant_filter = None
+        using_filter = False
+        if source_filter:
+            qdrant_filter = self._make_source_filter(source_filter)
+            if qdrant_filter and not self._check_filter_has_results(qdrant_filter):
+                print(f"[DEBUG] source_filter='{source_filter}' matched 0 "
+                      "chunks, falling back to unfiltered")
+                qdrant_filter = None
+            else:
+                using_filter = True
+
+        # Auto-detect weights
         if semantic_weight is None or keyword_weight is None:
             if self._is_product_code_query(query):
-                # Product code queries: heavily favor BM25
                 semantic_weight = 0.2
                 keyword_weight = 0.8
             elif self._is_keyword_heavy_query(query):
-                # Category/keyword queries: favor BM25 to match exact terms
                 semantic_weight = 0.25
                 keyword_weight = 0.75
             else:
-                # Natural language queries: balanced
                 semantic_weight = 0.5
                 keyword_weight = 0.5
-        
-        # Fetch more candidates when filtering to compensate for post-filter loss
-        fetch_k = max(top_k * 5, 30) if not allowed_indices else max(top_k * 20, 200)
-        semantic_results = self.search_semantic(query, fetch_k)
-        
-        # Expand query for BM25 (add synonyms/stemmed variants)
+
+        fetch_k = max(top_k * 20, 200) if using_filter else max(top_k * 5, 30)
+
+        # Channel 1: semantic (dense)
+        semantic_results = self.search_semantic(query, fetch_k, qdrant_filter)
+
+        # Channel 2: keyword (sparse) with query expansion
         bm25_query = self._expand_query_for_bm25(query)
-        keyword_results = self.search_keyword(bm25_query, fetch_k)
+        keyword_results = self.search_keyword(bm25_query, fetch_k, qdrant_filter)
 
-        # Apply source filter to channel results
-        if allowed_indices is not None:
-            semantic_results = [(idx, s) for idx, s in semantic_results if idx in allowed_indices]
-            keyword_results = [(idx, s) for idx, s in keyword_results if idx in allowed_indices]
-        
-        # Calculate RRF scores
-        rrf_scores = {}
-        
-        # Add semantic scores
-        for rank, (idx, _) in enumerate(semantic_results):
-            rrf_score = semantic_weight * (1.0 / (rrf_k + rank + 1))
-            rrf_scores[idx] = rrf_scores.get(idx, 0) + rrf_score
-        
-        # Add keyword scores
-        for rank, (idx, _) in enumerate(keyword_results):
-            rrf_score = keyword_weight * (1.0 / (rrf_k + rank + 1))
-            rrf_scores[idx] = rrf_scores.get(idx, 0) + rrf_score
+        # Channel 3: filename matching
+        filename_results = self.search_by_filename(query, fetch_k, qdrant_filter)
 
-        # Third channel: filename matching (helps product family queries)
-        filename_results = self.search_by_filename(query, fetch_k)
-        if allowed_indices is not None:
-            filename_results = [(idx, s) for idx, s in filename_results if idx in allowed_indices]
+        # ── RRF score calculation ─────────────────────────────────────
+        rrf_scores: Dict[int, float] = {}
+
+        for rank, (pid, _) in enumerate(semantic_results):
+            rrf_scores[pid] = rrf_scores.get(pid, 0) + (
+                semantic_weight * (1.0 / (rrf_k + rank + 1))
+            )
+
+        for rank, (pid, _) in enumerate(keyword_results):
+            rrf_scores[pid] = rrf_scores.get(pid, 0) + (
+                keyword_weight * (1.0 / (rrf_k + rank + 1))
+            )
+
         if filename_results:
             best_match_score = filename_results[0][1]
             filename_weight = 1.0 if best_match_score >= 2 else 0.3
-            for rank, (idx, score) in enumerate(filename_results):
-                rrf_score = filename_weight * (1.0 / (rrf_k + rank + 1))
-                rrf_scores[idx] = rrf_scores.get(idx, 0) + rrf_score
-            if best_match_score >= 2:
-                top_fn = self.metadata[filename_results[0][0]].get('source_file', '?') if filename_results[0][0] < len(self.metadata) else '?'
-                print(f"[DEBUG] Filename channel: best={best_match_score} terms matched, weight={filename_weight}, top='{top_fn}'")
+            for rank, (pid, _score) in enumerate(filename_results):
+                rrf_scores[pid] = rrf_scores.get(pid, 0) + (
+                    filename_weight * (1.0 / (rrf_k + rank + 1))
+                )
 
-        # Apply source-based boosting and boilerplate penalty
-        for idx in rrf_scores:
-            if idx < len(self.metadata):
-                meta = self.metadata[idx]
-                source_file = meta.get('source_file', '')
-                text = meta.get('text', '')
-                
-                # Penalize chunks that are mostly boilerplate footer text
-                text_flat = re.sub(r'\s+', ' ', text.lower())
-                if 'global leader in high performance' in text_flat and \
-                   'broad range of skus' in text_flat:
-                    rrf_scores[idx] *= 0.3
-                    continue
-                
-                rrf_scores[idx] *= self._source_type_boost(source_file)
-        
-        # Sort by combined RRF score (with source boost applied)
+        if not rrf_scores:
+            return []
+
+        # ── Fetch payloads for candidates ─────────────────────────────
+        sorted_pids = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
+        candidate_count = max(top_k * 5, 50)
+        payloads = self._batch_get_payloads(sorted_pids[:candidate_count])
+
+        # ── Source-type boost + boilerplate penalty ───────────────────
+        for pid in list(rrf_scores):
+            meta = payloads.get(pid)
+            if meta is None:
+                continue
+            source_file = meta.get("source_file", "")
+            text = meta.get("text", "")
+
+            text_flat = re.sub(r'\s+', ' ', text.lower())
+            if ('global leader in high performance' in text_flat
+                    and 'broad range of skus' in text_flat):
+                rrf_scores[pid] *= 0.3
+                continue
+
+            rrf_scores[pid] *= self._source_type_boost(source_file)
+
+        # Re-sort after boosts
         sorted_indices = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-        # ----- Source-diversity path (broad queries) -----
+        # ── Source-diversity path (broad queries) ─────────────────────
         if max_per_source is not None:
             source_counts: Dict[str, int] = defaultdict(int)
-            diversified = []
-            for idx, score in sorted_indices:
-                if idx < len(self.metadata):
-                    src = self.metadata[idx].get('source_file', '')
-                    norm_src = re.sub(r'__[0-9a-f]{8,}\.', '.', src)
-                    if source_counts[norm_src] < max_per_source:
-                        source_counts[norm_src] += 1
-                        diversified.append((self.metadata[idx], score))
-                        if len(diversified) >= top_k:
-                            break
+            diversified: List[Tuple[Dict, float]] = []
+            for pid, score in sorted_indices:
+                meta = payloads.get(pid)
+                if meta is None:
+                    continue
+                src = meta.get("source_file", "")
+                norm_src = re.sub(r'__[0-9a-f]{8,}\.', '.', src)
+                if source_counts[norm_src] < max_per_source:
+                    source_counts[norm_src] += 1
+                    diversified.append((meta, score))
+                    if len(diversified) >= top_k:
+                        break
             return diversified
 
-        # ----- Concentrated path (detail / follow-up queries) -----
-        # Context expansion: if the top result comes from a multi-chunk document,
-        # pull in sibling chunks so the LLM gets complete context (e.g., all 
-        # product specs from a Global SKU page, not just the intro chunk).
-        initial_results = []
-        for idx, score in sorted_indices[:top_k]:
-            if idx < len(self.metadata):
-                initial_results.append((idx, self.metadata[idx], score))
-        
+        # ── Concentrated path (context expansion) ─────────────────────
+        initial_results: List[Tuple[int, Dict, float]] = []
+        for pid, score in sorted_indices[:top_k]:
+            meta = payloads.get(pid)
+            if meta is not None:
+                initial_results.append((pid, meta, score))
+
         if initial_results:
-            top_source = initial_results[0][1].get('source_file', '')
-            top_total = initial_results[0][1].get('total_chunks', 1)
+            top_source = initial_results[0][1].get("source_file", "")
+            top_total = initial_results[0][1].get("total_chunks", 1)
             top_score = initial_results[0][2]
-            
-            # Only expand if top source has many chunks (multi-page document)
-            # and it scored significantly higher than #2
+
             should_expand = (
-                top_total > 5 and 
-                (len(initial_results) < 2 or top_score > initial_results[1][2] * 1.03)
+                top_total > 5
+                and (len(initial_results) < 2
+                     or top_score > initial_results[1][2] * 1.03)
             )
-            
+
             if should_expand:
-                # Find all chunks from this source and add missing ones
-                existing_idxs = {r[0] for r in initial_results}
-                sibling_chunks = []
-                for i, m in enumerate(self.metadata):
-                    if m.get('source_file') == top_source and i not in existing_idxs:
-                        sibling_chunks.append((i, m, top_score * 0.95))
-                
-                # Sort siblings by chunk_index to maintain document order
-                sibling_chunks.sort(key=lambda x: x[1].get('chunk_index', 0))
-                
-                # Insert siblings (up to half of top_k to leave room for other sources)
+                existing_pids = {r[0] for r in initial_results}
+                sibling_chunks = self._fetch_sibling_chunks(
+                    top_source, existing_pids, top_score,
+                )
                 max_siblings = top_k // 2
                 siblings_to_add = sibling_chunks[:max_siblings]
-                
-                # Build final result: top result + siblings + remaining results
+
                 final = [initial_results[0]]
                 final.extend(siblings_to_add)
-                remaining = [r for r in initial_results[1:] if r[0] not in {s[0] for s in siblings_to_add}]
+                sib_pids = {s[0] for s in siblings_to_add}
+                remaining = [r for r in initial_results[1:]
+                             if r[0] not in sib_pids]
                 final.extend(remaining)
                 initial_results = final[:top_k]
-        
+
         return [(meta, score) for _, meta, score in initial_results]
-    
+
+    def _fetch_sibling_chunks(
+        self,
+        source_file: str,
+        exclude_pids: set,
+        base_score: float,
+    ) -> List[Tuple[int, Dict, float]]:
+        """Fetch sibling chunks from the same source document."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        pts, _ = self.client.scroll(
+            collection_name=self.collection,
+            scroll_filter=Filter(must=[
+                FieldCondition(
+                    key="source_file",
+                    match=MatchValue(value=source_file),
+                )
+            ]),
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        siblings = []
+        for p in pts:
+            if p.id not in exclude_pids:
+                siblings.append((p.id, p.payload, base_score * 0.95))
+
+        siblings.sort(key=lambda x: x[1].get("chunk_index", 0))
+        return siblings
+
+    # ── Default search ────────────────────────────────────────────────
+
     def search(self, query: str, top_k: int = 10) -> List[Tuple[Dict, float]]:
-        """
-        Default search method - uses hybrid search.
-        
-        Args:
-            query: Query text
-            top_k: Number of results to return
-            
-        Returns:
-            List of tuples (chunk_dict, similarity_score)
-        """
         return self.search_hybrid(query, top_k)
 
 
-# Backward compatibility alias
+# Backward-compat alias
 VectorIndex = HybridIndex
 
 
+# ── RoutedIndex ───────────────────────────────────────────────────────────
+
 class RoutedIndex:
-    """Multi-index wrapper that routes queries to primary and/or manual indices.
-
-    The primary index holds datasheets, web pages, accessories, and FAQ.
-    The manual index holds user guides, installation manuals, and QRGs.
-    Queries are routed based on a ``scope`` parameter:
-      - "primary" (default): search only the primary index
-      - "both": search primary, then supplement with manual index results
-
-    The manual index loads in a background thread so the server starts fast.
-    Queries arriving before it's ready fall back to primary-only search.
+    """Multi-collection wrapper that routes queries to primary and/or
+    manual Qdrant collections based on a ``scope`` parameter.
     """
 
-    def __init__(self, primary_dir: str, manual_dir: Optional[str] = None,
-                 model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.primary = HybridIndex(primary_dir, model_name)
+    def __init__(
+        self,
+        qdrant_client,
+        primary_collection: str,
+        manual_collection: Optional[str] = None,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    ):
+        self.primary = HybridIndex(
+            primary_collection, qdrant_client, model_name,
+        )
         self._model_name = model_name
         self.manual: Optional[HybridIndex] = None
-        self._manual_loading = False
-        print(f"[RoutedIndex] Primary index: {self.primary.faiss_index.ntotal:,} vectors")
 
-        if manual_dir:
-            manual_path = Path(manual_dir)
-            if manual_path.exists() and (manual_path / "faiss.index").exists():
-                self._manual_loading = True
-                import threading
-                t = threading.Thread(target=self._load_manual_bg,
-                                     args=(manual_dir,), daemon=True)
-                t.start()
-                print(f"[RoutedIndex] Manual index loading in background thread...")
-            else:
-                print(f"[RoutedIndex] No manual index at {manual_dir} — manual scope disabled")
+        print(f"[RoutedIndex] Primary collection: '{primary_collection}' "
+              f"({self.primary._point_count:,} points)")
 
-    def _load_manual_bg(self, manual_dir: str):
-        """Load manual index in background thread."""
-        try:
-            import time
-            t0 = time.time()
-            self.manual = HybridIndex(manual_dir, self._model_name,
-                                      shared_model=self.primary.model)
-            elapsed = time.time() - t0
-            print(f"[RoutedIndex] Manual index ready: {self.manual.faiss_index.ntotal:,} vectors "
-                  f"({elapsed:.0f}s)")
-        except Exception as e:
-            print(f"[RoutedIndex] Manual index failed to load: {e}")
-        finally:
-            self._manual_loading = False
+        if manual_collection:
+            try:
+                self.manual = HybridIndex(
+                    manual_collection, qdrant_client, model_name,
+                    shared_model=self.primary.model,
+                )
+                print(f"[RoutedIndex] Manual collection: '{manual_collection}' "
+                      f"({self.manual._point_count:,} points)")
+            except Exception as e:
+                print(f"[RoutedIndex] Manual collection '{manual_collection}' "
+                      f"unavailable: {e}")
 
-    def search_hybrid(self, query: str, top_k: int = 10, scope: str = "primary",
-                      manual_top_k: int = 5, **kwargs) -> List[Tuple[Dict, float]]:
-        """Search primary and/or manual index based on scope.
+    # ── Delegated search ──────────────────────────────────────────────
 
-        scope="primary": primary only (default)
-        scope="manual": manual only
-        scope="both": primary + supplemental manual results
-
-        Falls back to primary if manual index is not yet ready.
-        """
-        manual = self.manual  # snapshot — safe even if loading in background
-
-        if not manual and self._manual_loading and scope in ("manual", "both"):
-            import time as _tw
-            _t0 = _tw.time()
-            while self._manual_loading and (_tw.time() - _t0) < 20:
-                _tw.sleep(0.5)
-            manual = self.manual
-            if manual:
-                print(f"[RoutedIndex] Waited {_tw.time()-_t0:.1f}s for manual index")
-            else:
-                print("[RoutedIndex] Manual index still not ready after wait — falling back to primary")
-
+    def search_hybrid(
+        self,
+        query: str,
+        top_k: int = 10,
+        scope: str = "primary",
+        manual_top_k: int = 5,
+        **kwargs,
+    ) -> List[Tuple[Dict, float]]:
         if scope == "manual":
-            if manual:
-                return manual.search_hybrid(query, top_k, **kwargs)
+            if self.manual:
+                return self.manual.search_hybrid(query, top_k, **kwargs)
             return self.primary.search_hybrid(query, top_k, **kwargs)
 
         results = self.primary.search_hybrid(query, top_k, **kwargs)
-        if scope == "both" and manual:
-            manual_results = manual.search_hybrid(query, manual_top_k, **kwargs)
-            seen = {r[0].get('chunk_id') for r in results}
+
+        if scope == "both" and self.manual:
+            manual_results = self.manual.search_hybrid(
+                query, manual_top_k, **kwargs,
+            )
+            seen = {r[0].get("chunk_id") for r in results}
             for chunk, score in manual_results:
-                cid = chunk.get('chunk_id')
+                cid = chunk.get("chunk_id")
                 if cid not in seen:
                     seen.add(cid)
                     results.append((chunk, score))
+
         return results
 
     def search_faq_questions(self, query: str, top_k: int = 5):
         return self.primary.search_faq_questions(query, top_k)
+
+    def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict]:
+        """Look up a chunk by ID across primary and manual collections."""
+        result = self.primary.get_chunk_by_id(chunk_id)
+        if result is None and self.manual:
+            result = self.manual.get_chunk_by_id(chunk_id)
+        return result
 
     @property
     def metadata(self):
@@ -696,91 +745,74 @@ class RoutedIndex:
         return self.primary.model
 
 
+# ── CLI test harness ──────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    # Test hybrid search
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Test hybrid search (FAISS + BM25)")
-    parser.add_argument(
-        "--index-dir",
-        default="embeddings/faiss_index/",
-        help="Directory containing indexes (default: embeddings/faiss_index/)"
+
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(
+        description="Test hybrid search against Qdrant",
     )
     parser.add_argument(
-        "--query",
-        help="Test query to search"
+        "--qdrant-url",
+        default=os.getenv("QDRANT_URL", "http://localhost:6333"),
     )
     parser.add_argument(
-        "--top-k",
-        type=int,
-        default=5,
-        help="Number of results (default: 5)"
+        "--collection",
+        default=os.getenv("QDRANT_COLLECTION_PRIMARY", "supermicro_primary"),
     )
-    parser.add_argument(
-        "--compare",
-        action="store_true",
-        help="Compare semantic vs keyword vs hybrid results"
-    )
-    
+    parser.add_argument("--query", help="Test query to search")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--compare", action="store_true",
+                        help="Compare semantic vs keyword vs hybrid")
+
     args = parser.parse_args()
-    
+
     try:
-        index = HybridIndex(args.index_dir)
-        
-        if args.query:
-            print(f"\n{'='*60}")
-            print(f"Query: '{args.query}'")
-            print(f"{'='*60}")
-            
-            if args.compare:
-                # Show tokenized query and detected type
-                query_tokens = tokenize_for_bm25(args.query)
-                is_product_code = index._is_product_code_query(args.query)
-                is_keyword_heavy = index._is_keyword_heavy_query(args.query)
-                print(f"\nQuery tokens: {query_tokens}")
-                print(f"Detected as product code: {is_product_code}")
-                print(f"Detected as keyword-heavy: {is_keyword_heavy}")
-                if is_product_code:
-                    print(f"Using weights: 20% semantic, 80% BM25")
-                elif is_keyword_heavy:
-                    print(f"Using weights: 25% semantic, 75% BM25")
-                else:
-                    print(f"Using weights: 50% semantic, 50% BM25")
-                
-                # Compare all three methods
-                print("\n--- SEMANTIC SEARCH (FAISS) ---")
-                semantic = index.search_semantic(args.query, args.top_k)
-                for i, (idx, score) in enumerate(semantic, 1):
-                    chunk = index.metadata[idx]
-                    print(f"{i}. [{score:.4f}] {chunk['source_file']}")
-                
-                print("\n--- KEYWORD SEARCH (BM25) ---")
-                keyword = index.search_keyword(args.query, args.top_k)
-                if not keyword:
-                    print("  (No BM25 results found!)")
-                for i, (idx, score) in enumerate(keyword, 1):
-                    chunk = index.metadata[idx]
-                    print(f"{i}. [{score:.4f}] {chunk['source_file']}")
-                
-                print("\n--- HYBRID SEARCH (RRF) ---")
-                hybrid = index.search_hybrid(args.query, args.top_k)
-                for i, (chunk, score) in enumerate(hybrid, 1):
-                    print(f"{i}. [{score:.6f}] {chunk['source_file']}")
-            else:
-                # Just show hybrid results
-                results = index.search(args.query, args.top_k)
-                print(f"\nTop {len(results)} hybrid results:")
-                for i, (chunk, score) in enumerate(results, 1):
-                    print(f"\n{i}. Score: {score:.6f}")
-                    print(f"   Source: {chunk['source_file']}")
-                    print(f"   Text preview: {chunk['text'][:200]}...")
+        from src.embed import get_qdrant_client
+    except ImportError:
+        from embed import get_qdrant_client
+
+    client = get_qdrant_client(args.qdrant_url)
+    index = HybridIndex(args.collection, client)
+
+    if args.query:
+        print(f"\n{'=' * 60}")
+        print(f"Query: '{args.query}'")
+        print(f"{'=' * 60}")
+
+        if args.compare:
+            print(f"\nProduct code query: {index._is_product_code_query(args.query)}")
+            print(f"Keyword-heavy query: {index._is_keyword_heavy_query(args.query)}")
+
+            print("\n--- SEMANTIC (dense) ---")
+            for i, (pid, score) in enumerate(
+                index.search_semantic(args.query, args.top_k), 1,
+            ):
+                meta = index.metadata[pid]
+                print(f"{i}. [{score:.4f}] {meta['source_file']}")
+
+            print("\n--- KEYWORD (sparse) ---")
+            for i, (pid, score) in enumerate(
+                index.search_keyword(args.query, args.top_k), 1,
+            ):
+                meta = index.metadata[pid]
+                print(f"{i}. [{score:.4f}] {meta['source_file']}")
+
+            print("\n--- HYBRID (RRF) ---")
+            for i, (chunk, score) in enumerate(
+                index.search_hybrid(args.query, args.top_k), 1,
+            ):
+                print(f"{i}. [{score:.6f}] {chunk['source_file']}")
         else:
-            print("\nHybrid index loaded successfully!")
-            print("  FAISS: semantic search")
-            print("  BM25: keyword search")
-            print("\nUse --query to test, --compare to see all methods side by side")
-    
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+            results = index.search(args.query, args.top_k)
+            print(f"\nTop {len(results)} hybrid results:")
+            for i, (chunk, score) in enumerate(results, 1):
+                print(f"\n{i}. Score: {score:.6f}")
+                print(f"   Source: {chunk['source_file']}")
+                print(f"   Text: {chunk['text'][:200]}...")
+    else:
+        print("\nIndex loaded. Use --query to test.")

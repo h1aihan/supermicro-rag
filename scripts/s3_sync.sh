@@ -80,7 +80,7 @@ do_push() {
     fi
 
     if [[ -d "$PROJECT_DIR/embeddings" ]]; then
-        log "Syncing embeddings/ ..."
+        log "Syncing embeddings/ (entity_graph.json + legacy FAISS if present)..."
         aws s3 sync "$PROJECT_DIR/embeddings/" "${S3_BASE}/embeddings/" --delete
         ok "embeddings/ synced"
     else

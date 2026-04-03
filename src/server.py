@@ -42,28 +42,36 @@ def get_chatbot() -> SupermicroChatbot:
     if _chatbot is not None:
         return _chatbot
 
-    # Import lazily so the web server can start quickly (and health checks pass)
-    # even if FAISS / sentence-transformers are slow to import or misconfigured.
     from src.chatbot import SupermicroChatbot
+    from src.embed import get_qdrant_client
 
-    index_dir = os.getenv("INDEX_DIR", "embeddings/primary_index/")
-    manual_dir = os.getenv("MANUAL_INDEX_DIR", "embeddings/manual_index/")
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
+    primary_collection = os.getenv("QDRANT_COLLECTION_PRIMARY", "supermicro_primary")
+    manual_collection = os.getenv("QDRANT_COLLECTION_MANUAL", "supermicro_manual")
     embedding_model = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     llm_model = os.getenv("LLM_MODEL", "gpt-5.2")
     llm_provider = os.getenv("LLM_PROVIDER", "openai")
     top_k = int(os.getenv("TOP_K", "10"))
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.5"))
     top_p = float(os.getenv("LLM_TOP_P", "1.0"))
+    entity_graph_path = os.getenv(
+        "ENTITY_GRAPH_PATH", "embeddings/primary_index/entity_graph.json",
+    )
+
+    client = get_qdrant_client(qdrant_url, qdrant_api_key)
 
     _chatbot = SupermicroChatbot(
-        index_dir=index_dir,
-        manual_dir=manual_dir,
+        qdrant_client=client,
+        primary_collection=primary_collection,
+        manual_collection=manual_collection,
         embedding_model=embedding_model,
         llm_model=llm_model,
         llm_provider=llm_provider,
         top_k=top_k,
         temperature=temperature,
         top_p=top_p,
+        entity_graph_path=entity_graph_path,
     )
     return _chatbot
 
@@ -198,6 +206,7 @@ def chat(req: ChatRequest):
     bot = get_chatbot()
     conversation_context = _build_conversation_context(req.history)
     result = bot.answer(req.message, conversation_context=conversation_context)
+
     return {
         "answer": result.get("answer", ""),
         "sources": result.get("sources", []),

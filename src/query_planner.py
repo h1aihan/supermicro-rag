@@ -599,7 +599,7 @@ def _fallback_plan(query: str) -> QueryPlan:
             plan.form_factor = ff
             plan.use_catalog = True
             break
-    
+
     print(f"[QueryPlanner] Fallback plan: {plan}")
     return plan
 

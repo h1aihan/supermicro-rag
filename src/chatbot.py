@@ -346,30 +346,36 @@ class SupermicroChatbot:
 
     def __init__(
         self,
-        index_dir: str = "embeddings/primary_index/",
-        manual_dir: str = "embeddings/manual_index/",
+        qdrant_client=None,
+        primary_collection: str = "supermicro_primary",
+        manual_collection: str = "supermicro_manual",
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         llm_model: str = "gpt-3.5-turbo",
         llm_provider: str = "openai",
         top_k: int = 10,
         temperature: float = 0.5,
         top_p: float = 1.0,
+        entity_graph_path: str = "embeddings/primary_index/entity_graph.json",
     ):
         """
         Initialize the chatbot.
         
         Args:
-            index_dir: Directory containing primary FAISS index
-            manual_dir: Directory containing manual FAISS index (user guides, etc.)
+            qdrant_client: Connected QdrantClient instance
+            primary_collection: Qdrant collection for primary index
+            manual_collection: Qdrant collection for manual index
             embedding_model: Sentence transformer model name
             llm_model: LLM model name
-            llm_provider: LLM provider (openai, ollama)
+            llm_provider: LLM provider (openai, anthropic, ollama)
             top_k: Number of chunks to retrieve
-            temperature: LLM sampling temperature (0.0 = deterministic, 1.0 = creative)
-            top_p: LLM nucleus sampling threshold (1.0 = no filtering)
+            temperature: LLM sampling temperature
+            top_p: LLM nucleus sampling threshold
+            entity_graph_path: Path to entity_graph.json file
         """
-        self.query_processor = RAGQueryProcessor(index_dir, embedding_model,
-                                                 manual_dir=manual_dir)
+        self.query_processor = RAGQueryProcessor(
+            qdrant_client, primary_collection, embedding_model,
+            manual_collection=manual_collection,
+        )
         self.llm_model = llm_model
         self.llm_provider = llm_provider
         self.top_k = top_k
@@ -385,15 +391,14 @@ class SupermicroChatbot:
         self._pdf_url_map = self._load_pdf_url_map()
 
         # Entity-relationship graph for multi-hop retrieval
-        self.entity_graph = self._load_entity_graph(index_dir)
+        self.entity_graph = self._load_entity_graph(entity_graph_path)
 
     def _effective_temperature(self, intent: str) -> float:
         """Uniform 0.1 across all intents for factual consistency."""
         return min(self.temperature, 0.1)
     
     @staticmethod
-    def _load_entity_graph(index_dir: str) -> Dict:
-        graph_path = os.path.join(index_dir, "entity_graph.json")
+    def _load_entity_graph(graph_path: str) -> Dict:
         if os.path.exists(graph_path):
             with open(graph_path) as f:
                 graph = json.load(f)
@@ -543,20 +548,20 @@ class SupermicroChatbot:
             chassis_chunk_ids = self.entity_graph.get(_exact_chassis, {}).get("chunk_ids", [])
             for cid in chassis_chunk_ids:
                 if cid and cid not in seen_ids:
-                    for meta in self.query_processor.index.metadata:
-                        if meta.get("chunk_id") == cid:
-                            seen_ids.add(cid)
-                            chunk = {
-                                "text": meta["text"],
-                                "source_file": meta["source_file"],
-                                "chunk_id": cid,
-                                "similarity_score": 0.0,
-                                "_graph_expanded": True,
-                                "_bom_chunk": True,
-                            }
-                            extra_chunks.insert(0, chunk)
-                            print(f"[EntityGraph]   +1 chassis identity chunk: {cid}")
-                            break
+                    meta = self.query_processor.index.get_chunk_by_id(cid)
+                    if meta:
+                        seen_ids.add(cid)
+                        chunk = {
+                            "text": meta["text"],
+                            "source_file": meta["source_file"],
+                            "chunk_id": cid,
+                            "similarity_score": 0.0,
+                            "_graph_expanded": True,
+                            "_bom_chunk": True,
+                        }
+                        extra_chunks.insert(0, chunk)
+                        print(f"[EntityGraph]   +1 chassis identity chunk: {cid}")
+                        break
 
         # Step 2: Backfill with individual accessory pages, prioritizing
         # by query-relevant type (e.g., MCP-290 for "rail kit" queries).
@@ -1253,67 +1258,51 @@ Sources: {source_summary}
 
 
 def main():
+    try:
+        from src.embed import get_qdrant_client
+    except ImportError:
+        from embed import get_qdrant_client
+
     parser = argparse.ArgumentParser(
         description="Supermicro RAG Chatbot"
     )
-    parser.add_argument(
-        "--query",
-        help="Single question to answer"
-    )
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Run in interactive mode"
-    )
-    parser.add_argument(
-        "--index-dir",
-        default="embeddings/primary_index/",
-        help="Directory containing primary FAISS index (default: embeddings/primary_index/)"
-    )
-    parser.add_argument(
-        "--manual-dir",
-        default="embeddings/manual_index/",
-        help="Directory containing manual FAISS index (default: embeddings/manual_index/)"
-    )
-    parser.add_argument(
-        "--embedding-model",
-        default="sentence-transformers/all-MiniLM-L6-v2",
-        help="Embedding model name (default: sentence-transformers/all-MiniLM-L6-v2)"
-    )
-    parser.add_argument(
-        "--llm-model",
-        default=None,
-        help="LLM model name (default: from .env or gpt-5.2)"
-    )
-    parser.add_argument(
-        "--llm-provider",
-        default=None,
-        help="LLM provider: openai or ollama (default: from .env or openai)"
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=10,
-        help="Number of chunks to retrieve (default: 10)"
-    )
-    
+    parser.add_argument("--query", help="Single question to answer")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Run in interactive mode")
+    parser.add_argument("--qdrant-url",
+                        default=os.getenv("QDRANT_URL", "http://localhost:6333"))
+    parser.add_argument("--primary-collection",
+                        default=os.getenv("QDRANT_COLLECTION_PRIMARY", "supermicro_primary"))
+    parser.add_argument("--manual-collection",
+                        default=os.getenv("QDRANT_COLLECTION_MANUAL", "supermicro_manual"))
+    parser.add_argument("--embedding-model",
+                        default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--llm-provider", default=None)
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--entity-graph",
+                        default=os.getenv("ENTITY_GRAPH_PATH",
+                                          "embeddings/primary_index/entity_graph.json"))
+
     args = parser.parse_args()
-    
-    # Get LLM settings from environment or args
+
     llm_model = args.llm_model or os.getenv("LLM_MODEL", "gpt-5.2")
     llm_provider = args.llm_provider or os.getenv("LLM_PROVIDER", "openai")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.5"))
     top_p = float(os.getenv("LLM_TOP_P", "1.0"))
-    
+
+    client = get_qdrant_client(args.qdrant_url)
     chatbot = SupermicroChatbot(
-        index_dir=args.index_dir,
-        manual_dir=args.manual_dir,
+        qdrant_client=client,
+        primary_collection=args.primary_collection,
+        manual_collection=args.manual_collection,
         embedding_model=args.embedding_model,
         llm_model=llm_model,
         llm_provider=llm_provider,
         top_k=args.top_k,
         temperature=temperature,
         top_p=top_p,
+        entity_graph_path=args.entity_graph,
     )
     
     if args.interactive:

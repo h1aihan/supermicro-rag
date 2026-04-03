@@ -162,21 +162,25 @@ class RAGQueryProcessor:
     
     def __init__(
         self, 
-        index_dir: str, 
+        qdrant_client,
+        primary_collection: str,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         enable_reranking: bool = True,
-        manual_dir: Optional[str] = None,
+        manual_collection: Optional[str] = None,
     ):
         """
-        Initialize the query processor with hybrid search (FAISS + BM25) and optional reranking.
+        Initialize the query processor.
         
         Args:
-            index_dir: Directory containing primary FAISS index, BM25 index, and metadata
+            qdrant_client: Connected QdrantClient instance
+            primary_collection: Qdrant collection name for the primary index
             model_name: Name of the sentence transformer model
             enable_reranking: Whether to use cross-encoder reranking
-            manual_dir: Optional directory containing the manual index (user guides, etc.)
+            manual_collection: Optional Qdrant collection for manual index
         """
-        self.index = RoutedIndex(index_dir, manual_dir, model_name)
+        self.index = RoutedIndex(
+            qdrant_client, primary_collection, manual_collection, model_name,
+        )
         self.enable_reranking = enable_reranking and (os.getenv("ENABLE_RERANKING", "1") != "0")
     
     FAQ_QBANK_MIN_SCORE = 0.55
@@ -303,66 +307,51 @@ class RAGQueryProcessor:
 
 if __name__ == "__main__":
     import argparse
-    
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    try:
+        from src.embed import get_qdrant_client
+    except ImportError:
+        from embed import get_qdrant_client
+
     parser = argparse.ArgumentParser(description="Test hybrid search with reranking")
-    parser.add_argument(
-        "--index-dir",
-        default="embeddings/faiss_index/",
-        help="Directory containing indexes (default: embeddings/faiss_index/)"
-    )
-    parser.add_argument(
-        "--query",
-        required=True,
-        help="Query to process"
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=5,
-        help="Number of results (default: 5)"
-    )
-    parser.add_argument(
-        "--max-per-source",
-        type=int,
-        default=3,
-        help="Max chunks per source document (default: 3)"
-    )
-    parser.add_argument(
-        "--no-rerank",
-        action="store_true",
-        help="Disable cross-encoder reranking"
-    )
-    
+    parser.add_argument("--qdrant-url",
+                        default=os.getenv("QDRANT_URL", "http://localhost:6333"))
+    parser.add_argument("--collection",
+                        default=os.getenv("QDRANT_COLLECTION_PRIMARY", "supermicro_primary"))
+    parser.add_argument("--query", required=True, help="Query to process")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--max-per-source", type=int, default=3)
+    parser.add_argument("--no-rerank", action="store_true")
+
     args = parser.parse_args()
-    
-    # Disable reranking if requested
+
     if args.no_rerank:
         os.environ["ENABLE_RERANKING"] = "0"
-    
+
     try:
         print(f"\n{'='*80}")
         print("Initializing RAG Query Processor")
         print(f"{'='*80}")
-        
-        processor = RAGQueryProcessor(args.index_dir, enable_reranking=not args.no_rerank)
-        
-        # Show query expansion
+
+        client = get_qdrant_client(args.qdrant_url)
+        processor = RAGQueryProcessor(
+            client, args.collection,
+            enable_reranking=not args.no_rerank,
+        )
+
         expanded = preprocess_query(args.query)
         if expanded != args.query:
-            print(f"\nQuery expansion: '{args.query}' → '{expanded}'")
-        
+            print(f"\nQuery expansion: '{args.query}' -> '{expanded}'")
+
         print(f"\n{'='*80}")
         print(f"SEARCH: '{args.query}'")
-        if processor.enable_reranking:
-            print("Mode: Hybrid (FAISS + BM25) + Cross-encoder Reranking")
-        else:
-            print("Mode: Hybrid (FAISS + BM25)")
         print(f"{'='*80}")
-        
+
         chunks = processor.retrieve(args.query, args.top_k, args.max_per_source)
-        
         print(f"\nRetrieved {len(chunks)} chunks:\n")
-        
+
         for i, chunk in enumerate(chunks, 1):
             print(f"{'='*80}")
             score_info = f"Score: {chunk['similarity_score']:.6f}"
@@ -373,7 +362,7 @@ if __name__ == "__main__":
             print(f"{'='*80}")
             print(chunk['text'][:500])
             print("\n")
-    
+
     except Exception as e:
         print(f"Error: {e}")
         import traceback
