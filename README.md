@@ -1,21 +1,37 @@
-# Supermicro RAG Chatbot
+# Enterprise RAG Q&A Platform
 
-A Retrieval-Augmented Generation (RAG) chatbot that answers questions about Supermicro products, solutions, and documentation using 6000+ PDF documents and structured web content.
+A production-style **retrieval-augmented generation (RAG)** stack for answering questions over large technical document corpora, **structured product catalogs**, and FAQ content. It combines semantic and lexical search, intent-aware routing, and multi-turn dialogue—exposed through a **REST API**, **web chat UI**, and **containerized** cloud deployment.
+
+> **Sample corpus:** This repository is configured for enterprise server hardware documentation (thousands of PDFs plus scraped web/FAQ data). The architecture is domain-agnostic: swap `data/`, indexes, and taxonomy prompts for your own knowledge base.
+
+---
+
+## Highlights (what this project demonstrates)
+
+- **Hybrid retrieval** — dense (FAISS) + sparse (BM25) search with reciprocal rank fusion; optional cross-encoder reranking  
+- **Intent-aware query planning** — fast LLM step classifies user intent (e.g. list, detail, compare, FAQ, follow-up) and produces retrieval plans  
+- **Multi-collection routing** — separate vector indexes for *spec/marketing/FAQ* vs *long-form manuals*, selected by query type  
+- **Structured + unstructured fusion** — JSONL product catalog for filters and listings; vector index for narrative docs  
+- **Graph-assisted retrieval** — entity graph over index metadata for related-document expansion  
+- **FAQ specialization** — question-to-question matching layered with hybrid search for policy-style Q&A  
+- **Operational readiness** — health endpoints, env-based configuration, Docker, and documented AWS (ECR/EC2) rollout  
+
+---
 
 ## Features
 
-- **Hybrid search** — FAISS semantic search + BM25 keyword matching with Reciprocal Rank Fusion
-- **Dual-index routing** — separate primary (datasheets, web pages, FAQ) and manual (user guides, QRGs) indices, queried based on intent
-- **LLM query planner** — classifies intent (list / detail / compare / recommend / faq / general) and routes to catalog, manual index, or primary RAG
-- **Entity graph** — lightweight entity-relationship graph over primary index metadata for multi-hop retrieval
-- **FAQ question bank** — question-to-question cosine matching for eStore FAQ, combined with source-filtered hybrid search
-- **Product catalog integration** — structured product listing from `data/pages/products.jsonl`
-- **Document links** — deterministic manual PDF download links via `data/discovered_pdfs.txt` (crawler-discovered URLs), shown only for manual-type queries
-- **Local embeddings** with sentence-transformers (no API cost for search)
-- **Anthropic Claude or OpenAI** for answer generation with source citations
-- **Multi-turn conversation** — follow-up detection with context carry-over
-- **Web UI** and REST API via FastAPI
-- **Docker-ready** for AWS EC2 deployment via ECR
+- **Dual-index routing** — primary pool (datasheets, web-derived content, FAQ, accessories) vs manual pool (user guides, installation docs), chosen by planner and doc-type hints  
+- **LLM query planner** — outputs structured plan: intent, filters, rewritten search queries, catalog/RAG flags, manual vs primary scope  
+- **Entity graph** — lightweight relationship layer on primary metadata for multi-hop context  
+- **FAQ question bank** — cosine match on FAQ titles/questions plus source-filtered hybrid retrieval  
+- **Product catalog** — structured listings from `data/pages/products.jsonl` (replace with your own schema)  
+- **Document links** — deterministic PDF URLs from `data/discovered_pdfs.txt` for manual-style answers  
+- **Local embeddings** — sentence-transformers for indexing and search (no embedding API cost at query time)  
+- **Answer generation** — OpenAI or Anthropic (or Ollama) with source-backed responses  
+- **Multi-turn chat** — follow-up detection and context carry-over  
+- **FastAPI** — Web UI (`static/`) and JSON API  
+
+---
 
 ## Quick Start
 
@@ -26,238 +42,170 @@ pip install -r requirements.txt
 
 # 2. Configure API keys
 cp .env.example .env
-# Edit .env — set ANTHROPIC_API_KEY or OPENAI_API_KEY
+# Edit .env — set ANTHROPIC_API_KEY and/or OPENAI_API_KEY
 
-# 3. Build the index (PDFs + web pages)
+# 3. Build indexes (PDFs + web-derived JSONL)
 python setup_rag.py                    # both PDFs and data/pages
-# python setup_rag.py --source pages   # only web content
-# python setup_rag.py --source pdf     # only PDFs
+# python setup_rag.py --source pages   # web content only
+# python setup_rag.py --source pdf     # PDFs only
 
 # 4. Run
-python src/chatbot.py --interactive          # CLI mode
-uvicorn src.server:app --host 0.0.0.0 --port 8000  # Web UI at http://localhost:8000
+python src/chatbot.py --interactive                    # CLI
+uvicorn src.server:app --host 0.0.0.0 --port 8000      # http://localhost:8000
 ```
+
+---
 
 ## Testing
 
 ```bash
-python tests/test_product_queries.py                    # run all tests
-python tests/test_product_queries.py --summary          # with quality hints
-python tests/test_product_queries.py --category detail   # one category
-python tests/test_product_queries.py --id rec_8gpu_h200  # single test
-python tests/test_product_queries.py --dry-run           # list queries only
+python tests/test_product_queries.py                    # full suite
+python tests/test_product_queries.py --summary          # quality hints
+python tests/test_product_queries.py --category detail  # one category
+python tests/test_product_queries.py --id rec_8gpu_h200 # single case
+python tests/test_product_queries.py --dry-run          # list only
 python tests/test_product_queries.py --output results.txt --model claude-sonnet-4-5
+python -m pytest tests/test_form_factors.py -v         # form-factor helpers
 ```
 
-Categories: `list`, `detail`, `compare`, `general`, `conversational`, `recommendation`, `misspell`, `multi`, `followup`, `faq`.
+Example categories in the eval harness: `list`, `detail`, `compare`, `general`, `conversational`, `recommendation`, `misspell`, `multi`, `followup`, `faq`.
+
+---
 
 ## Architecture
 
 ```
-PDFs (pdfs/) + Web pages (data/pages/*.jsonl)
+PDFs + Web JSONL (data/pages)
        |
-   Text extraction (pypdf / process_pages)
+   Extract / normalize text
        |
-   Chunking (1000 chars, 200 overlap)
+   Chunking
        |
-   Split by doc type (setup_rag.py)
+   Index build (setup_rag.py)
        |
-   ┌───────────────────┬────────────────────────┐
-   Primary index       Manual index             Entity graph
-   (datasheets, web,   (MNL-*, QRG-*,          (primary metadata)
-    FAQ, accessories)    user guides, SC*)
-   └───────┬───────────┴────────┬───────────────┘
-           |                    |
-   Query ──> Query Planner (Haiku) ──> RoutedIndex ──> Hybrid Retrieval
-           |                                               |
-           |  Product Catalog (products.jsonl)              |
-           └───────────────────────────────────────────────> Answer LLM
-                                                            + doc links
+   ┌────────────────────────┬─────────────────────────┐
+   Primary vector index     Manual vector index       Entity graph
+   (specs, web, FAQ, …)     (guides, procedures)      (on primary metadata)
+   └───────────┬────────────┴────────────┬────────────┘
+               |                         |
+   User query → Query planner (small LLM) → Routed hybrid retrieval
+               |                                    |
+               +── Structured catalog (JSONL) ──────┴──→ Answer LLM (+ links)
 ```
 
-## Project Structure
+---
+
+## Repository Layout
 
 ```
-supermicro-rag/
 ├── src/
-│   ├── server.py          # FastAPI web server + chat UI
-│   ├── chatbot.py         # Main RAG chatbot (LLM calls, prompt assembly, doc links)
-│   ├── query_planner.py   # Intent classification + search query generation
-│   ├── query.py           # Hybrid retrieval (FAISS + BM25) + FAQ question bank
-│   ├── product_catalog.py # Structured product lookup from products.jsonl
-│   ├── index.py           # HybridIndex + RoutedIndex (primary/manual routing)
-│   ├── embed.py           # Embedding generation
-│   ├── chunk.py           # Text chunking
-│   ├── extract.py         # PDF text extraction
-│   ├── entity_graph.py    # Entity-relationship graph for multi-hop retrieval
-│   └── process_pages.py   # Web page JSONL → chunkable text
-├── scripts/
-│   ├── aws_push_ecr.sh    # Build + push Docker image to ECR
-│   ├── s3_sync.sh         # Push/pull data + embeddings to/from S3
-│   ├── ingest_faq.py      # Convert estore_faq.jsonl → rag_content.jsonl
-│   └── ingest_accessories.py
-├── data/
-│   ├── pages/             # products.jsonl, rag_content.jsonl (includes FAQ)
-│   └── discovered_pdfs.txt # Crawler-discovered PDF URLs (for manual download links)
+│   ├── server.py           # FastAPI app + chat UI
+│   ├── chatbot.py          # Orchestration, prompts, citations
+│   ├── query_planner.py    # Intent + plan JSON
+│   ├── query.py            # Hybrid retrieval + FAQ bank
+│   ├── product_catalog.py  # Structured catalog filters
+│   ├── form_factors.py     # Shared form-factor vocabulary
+│   ├── index.py            # HybridIndex + multi-index routing
+│   ├── embed.py            # Embeddings
+│   ├── chunk.py            # Chunking
+│   ├── extract.py          # PDF text extraction
+│   ├── entity_graph.py     # Graph build / traversal
+│   └── process_pages.py    # JSONL pages → text chunks
+├── scripts/                # ingest helpers, AWS/S3 utilities
+├── data/pages/             # products.jsonl, rag_content.jsonl, …
+├── data/discovered_pdfs.txt
 ├── tests/
-│   └── test_product_queries.py
-├── static/index.html      # Chat UI
+├── static/index.html
 ├── embeddings/
-│   ├── primary_index/     # Datasheets, web pages, FAQ, accessories (~127K vectors)
-│   └── manual_index/      # User guides, QRGs, installation manuals (~583K vectors)
+│   ├── primary_index/
+│   └── manual_index/
 ├── Dockerfile
 ├── requirements.txt
 └── setup_rag.py
 ```
 
+---
+
 ## Configuration
 
-Set these in `.env` (see `.env.example`):
+Key environment variables (see `.env.example`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLM_PROVIDER` | `openai` | `openai`, `anthropic`, or `ollama` |
-| `OPENAI_API_KEY` | — | Required if provider is `openai` |
-| `LLM_MODEL` | `gpt-5.2` | OpenAI model name |
-| `ANTHROPIC_API_KEY` | — | Required if provider is `anthropic` |
-| `ANTHROPIC_MODEL` | `claude-opus-4-5` | Anthropic model for answer generation |
-| `PLANNER_MODEL` | `claude-haiku-4-5` | Cheap model for query planning |
-| `LLM_TEMPERATURE` | `0.5` | Sampling temperature (0 = deterministic) |
-| `LLM_TOP_P` | `1.0` | Nucleus sampling (1.0 = disabled) |
-| `TOP_K` | `10` | Chunks to retrieve per query |
-| `INDEX_DIR` | `embeddings/primary_index/` | Path to primary FAISS index |
-| `MANUAL_INDEX_DIR` | `embeddings/manual_index/` | Path to manual FAISS index |
-| `FAISS_MMAP` | `1` | Memory-map index to reduce RAM usage |
-| `ENABLE_RERANKING` | `1` | Cross-encoder reranking (0 = off, faster) |
+| `OPENAI_API_KEY` | — | If using OpenAI |
+| `LLM_MODEL` | (see `.env.example`) | Answer model |
+| `ANTHROPIC_API_KEY` | — | If using Anthropic |
+| `PLANNER_MODEL` | (see `.env.example`) | Small/fast model for planning |
+| `TOP_K` | `10` | Chunks retrieved per search pass |
+| `INDEX_DIR` | `embeddings/primary_index/` | Primary FAISS index path |
+| `MANUAL_INDEX_DIR` | `embeddings/manual_index/` | Manual FAISS index path |
+| `FAISS_MMAP` | `1` | Memory-map indexes |
+| `ENABLE_RERANKING` | `1` | Cross-encoder reranker on/off |
 
-## Deployment (AWS EC2 + Docker)
+---
 
-EC2 is used instead of serverless to handle the ~1.5GB FAISS index without startup timeouts.
+## Deployment (Docker + AWS EC2)
 
-### Prerequisites
+Indexes are large (on the order of **~1GB+** FAISS + metadata); a small **EC2** instance with Docker is a practical pattern (avoids cold-start limits of some serverless options).
 
-- AWS CLI configured with ECR push permissions
-- `.env` must contain `AWS_ACCOUNT_ID` and `AWS_REGION`
-- EC2 instance running with Docker installed and an SSH key (e.g. `~/.ssh/supermicro-rag-key.pem`)
-
-### Step 1 — Build and push Docker image to ECR
+### Build and push (ECR)
 
 ```bash
 ./scripts/aws_push_ecr.sh
 ```
 
-The script reads `AWS_ACCOUNT_ID`, `AWS_REGION`, and `ECR_REPO` (default `supermicro-rag`) from `.env`, creates the ECR repository if needed, builds the image, and pushes it.
+Requires `AWS_ACCOUNT_ID`, `AWS_REGION`, and `ECR_REPO` in `.env` (default repo name is set for this project; change to match your registry).
 
-### Step 2 — Copy index and data files to EC2
+### Ship indexes and data to the host
 
-Use wildcards to copy **contents** into the target directories (avoids nested `dir/dir/` problems).
-
-Each index directory must contain: `faiss.index`, `bm25.pkl`, `metadata.jsonl`.
-The primary index also contains `entity_graph.json` (multi-hop retrieval).
+Each index directory should contain at least: `faiss.index`, `bm25.pkl`, `metadata.jsonl`. Primary also uses `entity_graph.json` when present.
 
 ```bash
-EC2=ec2-user@<IP>
-KEY=~/.ssh/supermicro-rag-key.pem
+EC2=user@<INSTANCE_IP>
+KEY=~/.ssh/your-key.pem
 
-# Create target directories on EC2
 ssh -i $KEY $EC2 "mkdir -p ~/embeddings/primary_index ~/embeddings/manual_index ~/data/pages ~/data"
 
-# Copy primary index (datasheets, web pages, FAQ, accessories + entity graph)
 scp -i $KEY embeddings/primary_index/* $EC2:~/embeddings/primary_index/
-
-# Copy manual index (user guides, QRGs, installation manuals)
 scp -i $KEY embeddings/manual_index/* $EC2:~/embeddings/manual_index/
-
-# Copy page data (products.jsonl, rag_content.jsonl, etc.)
 scp -i $KEY data/pages/* $EC2:~/data/pages/
-
-# Copy PDF URL map (enables manual download links in chat)
 scp -i $KEY data/discovered_pdfs.txt $EC2:~/data/
 ```
 
-Verify all files landed:
+### Run container on EC2
+
+Authenticate Docker to ECR, set your image URI, then:
 
 ```bash
-ssh -i $KEY $EC2 "ls -lh ~/embeddings/primary_index/ ~/embeddings/manual_index/ ~/data/pages/ ~/data/discovered_pdfs.txt"
-```
-
-Expected in `primary_index/`: `faiss.index`, `bm25.pkl`, `metadata.jsonl`, `entity_graph.json`.
-Expected in `manual_index/`: `faiss.index`, `bm25.pkl`, `metadata.jsonl`.
-
-### Step 3 — Pull image and run on EC2
-
-SSH into the instance first, then pull and run:
-
-```bash
-ssh -i $KEY $EC2
-
-# On EC2:
-ECR_IMAGE=<ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/supermicro-rag:latest
-
-# Authenticate Docker to ECR
-aws ecr get-login-password --region <REGION> \
-  | docker login --username AWS --password-stdin <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com
-
-# Pull the latest image
-docker pull $ECR_IMAGE
-
-# Stop any existing container
-docker stop supermicro-rag 2>/dev/null; docker rm supermicro-rag 2>/dev/null
-
-# Run
-docker run -d --name supermicro-rag -p 8000:8000 \
+docker run -d --name rag-app -p 8000:8000 \
   -v ~/embeddings/primary_index:/app/embeddings/primary_index:ro \
   -v ~/embeddings/manual_index:/app/embeddings/manual_index:ro \
   -v ~/data/pages:/app/data/pages:ro \
   -v ~/data/discovered_pdfs.txt:/app/data/discovered_pdfs.txt:ro \
-  -e ANTHROPIC_API_KEY="sk-ant-..." \
+  -e ANTHROPIC_API_KEY="..." \
   -e LLM_PROVIDER=anthropic \
-  -e ANTHROPIC_MODEL=claude-sonnet-4-5 \
-  -e PLANNER_MODEL=claude-haiku-4-5 \
-  -e LLM_TEMPERATURE=0.1 \
-  -e LLM_TOP_P=1.0 \
   -e TOP_K=15 \
   -e FAISS_MMAP=1 \
-  -e ENABLE_RERANKING=0 \
-  $ECR_IMAGE
+  <YOUR_ECR_IMAGE>:latest
 ```
 
-### Step 4 — Verify
+Verify: `GET /health`, `docker logs rag-app`. UI: `http://<IP>:8000` · API: `POST /api/chat`.
 
-```bash
-# Check container logs
-docker logs -f supermicro-rag
-
-# Health check
-curl http://localhost:8000/health
-```
-
-Startup logs should show all components loading:
-
-```
-[RoutedIndex] Primary index: 127,xxx vectors
-[RoutedIndex] Manual index: 583,xxx vectors
-[EntityGraph] Loaded graph: X,xxx entities
-[FAQ Bank] Built question bank: N questions
-[ProductCatalog] Loaded N products
-[PDF URL Map] Loaded N PDF download links
-```
-
-If any line is missing or shows a warning, the corresponding data file was not mounted correctly.
-
-Access: `http://<IP>:8000` (Web UI) | `POST /api/chat` (API) | `GET /health`
+---
 
 ## Troubleshooting
 
-- **"FAISS index not found"** — Run `python setup_rag.py` or check `INDEX_DIR` / `MANUAL_INDEX_DIR` paths and volume mounts.
-- **"No entity_graph.json found"** — Rebuild with `python src/entity_graph.py --metadata embeddings/primary_index/metadata.jsonl --output embeddings/primary_index/entity_graph.json`, then re-SCP `primary_index/*` to EC2.
-- **Manual queries not using manual index** — Verify `MANUAL_INDEX_DIR` is set and the manual index volume is mounted. Logs should show `[RoutedIndex] Manual index:`.
-- **No manual download links** — Check that `data/discovered_pdfs.txt` is mounted. Logs should show `[PDF URL Map] Loaded N PDF download links`.
-- **Product catalog empty** — Check that `data/pages/products.jsonl` is mounted and `PRODUCTS_FILE` points to it.
-- **Slow first request** — The FAISS index + sentence-transformers model download takes 1-2 min on first cold start.
-- **Out of memory** — Use `t3.large` (8GB) instead of `t3.medium` (4GB).
-- **FAQ not working** — Check for `[FAQ Bank] Built question bank: N questions` in startup logs. If missing, ensure `rag_content.jsonl` was ingested with FAQ entries via `scripts/ingest_faq.py` and the index was rebuilt.
-- **Nested directory on SCP** — Use `scp files/* host:~/target/` (not `scp -r dir host:~/`) to copy contents flat.
+- **Missing FAISS index** — Run `python setup_rag.py` or fix `INDEX_DIR` / mounts.  
+- **No `entity_graph.json`** — Rebuild per `src/entity_graph.py` CLI and copy into `primary_index/`.  
+- **Manual questions hit wrong index** — Confirm `MANUAL_INDEX_DIR` and logs show the manual index loaded.  
+- **No PDF download links** — Mount `data/discovered_pdfs.txt`.  
+- **Empty catalog** — Mount `products.jsonl` and check `PRODUCTS_FILE`.  
+- **Cold start slow** — First load of models + mmap can take minutes on small instances.  
+- **OOM** — Prefer **8GB+** RAM for dual indexes + reranker.  
+- **SCP nested folders** — Copy with `scp dir/* host:~/target/` for flat contents.  
+
+---
 
 ## License
 
