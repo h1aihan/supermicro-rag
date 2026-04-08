@@ -17,6 +17,11 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
+try:
+    from src.form_factors import extract_form_factor
+except ImportError:
+    from form_factors import extract_form_factor
+
 
 class ProductCatalog:
     """In-memory product catalog built from products.jsonl."""
@@ -51,15 +56,7 @@ class ProductCatalog:
         model = product.get("model", "")
         chassis = product.get("chassis", "")
         
-        # Extract form factor from chassis or name
-        form_factor = "Other"
-        for ff in ["1U", "2U", "4U", "8U"]:
-            if ff in chassis or ff in name:
-                form_factor = ff
-                break
-        if "mid-tower" in name.lower() or "mid-tower" in chassis.lower():
-            form_factor = "Mid-Tower"
-        product["form_factor"] = form_factor
+        product["form_factor"] = extract_form_factor(name, chassis, model)
         
         # Extract product SKU (e.g., SYS-521C-NR from the name)
         sku_match = re.search(

@@ -1,0 +1,296 @@
+# Golden set for deterministic retrieval and answer quality evaluation.
+#
+# Each entry defines ground truth for one query:
+#   must_retrieve:      substring patterns that MUST appear in at least one source filename (top-K)
+#   must_not_retrieve:  substring patterns that must NOT appear in any source filename
+#   min_sources:        minimum number of unique sources expected
+#   facts:              factual claims the final LLM answer must contain (for LLM-as-judge)
+#   rubric:             grading rubric for the LLM judge
+#   scope:              search scope override ("primary", "manual", "both") -- defaults to "primary"
+#   conversation:       optional prior conversation context (for follow-up queries)
+
+# ─── Detail: specific product queries ─────────────────────────────────────
+
+- id: detail_521ge
+  query: "What are the specs of SYS-521GE-TNRT?"
+  category: detail
+  must_retrieve:
+    - "sys-521ge-tnrt"
+    - "521ge"
+  must_not_retrieve:
+    - "sys-421ge"
+  min_sources: 3
+  facts:
+    - "5U form factor"
+    - "dual Intel Xeon"
+    - "supports H100 GPUs"
+  rubric: "Must describe the SYS-521GE-TNRT with accurate specs from the datasheet"
+
+- id: detail_821ge
+  query: "Tell me about the SYS-821GE-TNHR"
+  category: detail
+  must_retrieve:
+    - "821ge"
+  min_sources: 3
+  facts:
+    - "8U form factor"
+    - "HGX"
+    - "NVLink"
+  rubric: "Must describe the 8U GPU server with H100/H200 HGX specs"
+
+- id: detail_partial_521ge
+  query: "Tell me about the 521GE"
+  category: detail
+  must_retrieve:
+    - "521ge"
+  min_sources: 2
+  facts:
+    - "5U"
+    - "GPU"
+  rubric: "Should resolve partial product code to SYS-521GE-TNRT and describe it"
+
+- id: detail_gpu_count_521ge
+  query: "How many GPUs does the SYS-521GE-TNRT support?"
+  category: detail
+  must_retrieve:
+    - "521ge"
+  min_sources: 2
+  facts:
+    - "GPU"
+  rubric: "Must state the number of GPUs supported by SYS-521GE-TNRT"
+
+- id: detail_8u_power
+  query: "What is the power consumption of the 8U GPU server?"
+  category: detail
+  must_retrieve:
+    - "821ge"
+  min_sources: 2
+  facts:
+    - "power"
+  rubric: "Must reference power specs for the 8U GPU server (SYS-821GE)"
+
+# ─── List: product enumeration queries ────────────────────────────────────
+
+- id: list_1u_servers
+  query: "List all 1U servers"
+  category: list
+  must_retrieve:
+    - "1u"
+  min_sources: 5
+  facts:
+    - "CloudDC"
+    - "Hyper"
+    - "Mainstream"
+  rubric: "Must list multiple 1U server models across product families"
+
+- id: list_gpu_servers
+  query: "What GPU servers do you have?"
+  category: list
+  must_retrieve:
+    - "gpu"
+  min_sources: 3
+  facts:
+    - "SYS-521GE"
+    - "SYS-821GE"
+  rubric: "Must enumerate GPU-optimized servers across form factors"
+
+- id: list_gold_series
+  query: "Show me Gold Series products"
+  category: list
+  must_retrieve:
+    - "Gold_Series"
+  min_sources: 3
+  facts:
+    - "pre-configured"
+    - "-G1"
+  rubric: "Must list Gold Series quick-ship SKUs with -G1/-G2 suffixes"
+
+- id: list_clouddc_2u
+  query: "What 2U CloudDC servers are available?"
+  category: list
+  must_retrieve:
+    - "clouddc"
+  min_sources: 2
+  facts:
+    - "SYS-621C"
+    - "2U"
+  rubric: "Must list 2U CloudDC models for both Intel and AMD platforms"
+
+- id: list_storage
+  query: "List storage solutions"
+  category: list
+  must_retrieve:
+    - "storage"
+  min_sources: 2
+  facts:
+    - "SuperStorage"
+  rubric: "Must describe SuperStorage or storage-focused product lines"
+
+# ─── FAQ: eStore operational questions ────────────────────────────────────
+
+- id: faq_return_policy
+  query: "What is the return policy for Supermicro eStore?"
+  category: faq
+  must_retrieve:
+    - "FAQ"
+  min_sources: 1
+  facts:
+    - "30"
+    - "return"
+  rubric: "Must cite the 30-day return policy with restocking fee details"
+
+- id: faq_shipping
+  query: "Does Supermicro ship internationally?"
+  category: faq
+  must_retrieve:
+    - "FAQ"
+  min_sources: 1
+  facts:
+    - "US"
+    - "Canada"
+  rubric: "Must state US and Canada only shipping policy"
+
+- id: faq_warranty
+  query: "What is the warranty on Supermicro eStore servers?"
+  category: faq
+  must_retrieve:
+    - "FAQ"
+  min_sources: 1
+  facts:
+    - "3-year"
+    - "warranty"
+  rubric: "Must describe 3-year labor and parts warranty"
+
+- id: faq_payment
+  query: "What payment methods does Supermicro eStore accept?"
+  category: faq
+  must_retrieve:
+    - "FAQ"
+  min_sources: 1
+  facts:
+    - "Visa"
+    - "MasterCard"
+  rubric: "Must list accepted credit card brands"
+
+# ─── Compare: side-by-side queries ───────────────────────────────────────
+
+- id: compare_1u_2u
+  query: "Compare 1U and 2U servers"
+  category: compare
+  must_retrieve:
+    - "1u"
+    - "2u"
+  min_sources: 4
+  facts:
+    - "1U"
+    - "2U"
+  rubric: "Must contrast 1U and 2U form factors with specific tradeoffs"
+
+- id: compare_gold_standard
+  query: "What is the difference between Gold Series and standard products?"
+  category: compare
+  must_retrieve:
+    - "Gold"
+  min_sources: 2
+  facts:
+    - "pre-configured"
+    - "quick ship"
+  rubric: "Must explain Gold Series as pre-configured vs standard BTO"
+
+# ─── General: concept/knowledge queries ──────────────────────────────────
+
+- id: general_ipmi
+  query: "How does IPMI work?"
+  category: general
+  must_retrieve:
+    - "IPMI"
+  min_sources: 1
+  scope: both
+  facts:
+    - "management"
+    - "BMC"
+  rubric: "Must explain IPMI as a remote management standard"
+
+- id: general_global_sku
+  query: "What is the Global SKU program?"
+  category: general
+  must_retrieve:
+    - "Global_SKU"
+  min_sources: 1
+  facts:
+    - "Global SKU"
+  rubric: "Must explain the Global SKU Program as a logistics/fulfillment program"
+
+# ─── Accessory: cross-document graph queries ─────────────────────────────
+
+- id: accessory_railkit
+  query: "Find me the rail kit part number for SYS-511R-M"
+  category: accessory
+  must_retrieve:
+    - "accessory"
+  min_sources: 1
+  facts:
+    - "MCP-290"
+  rubric: "Must provide a specific MCP-290 series rail kit part number"
+
+- id: accessory_addon_cards
+  query: "What add-on cards are compatible with SYS-521GE-TNRT?"
+  category: accessory
+  must_retrieve:
+    - "521ge"
+  min_sources: 1
+  facts:
+    - "AOC"
+  rubric: "Must list AOC add-on card options for the 521GE"
+
+# ─── Discovery: multi-constraint product search ──────────────────────────
+
+- id: discovery_epyc_2u
+  query: "Find me a dual processor 2U AMD EPYC 9005 system that supports 12 3.5 drive bays"
+  category: discovery
+  must_retrieve:
+    - "2u"
+  min_sources: 1
+  facts:
+    - "AMD EPYC"
+    - "2U"
+  rubric: "Must identify a specific 2U dual EPYC system with 12 drive bays"
+
+- id: discovery_1u_nvme
+  query: "I need a 1U single processor server with at least 10 NVMe drive bays"
+  category: discovery
+  must_retrieve:
+    - "1u"
+  min_sources: 1
+  facts:
+    - "NVMe"
+    - "1U"
+  rubric: "Must identify 1U single-socket systems with 10+ NVMe bays"
+
+# ─── Follow-up: conversation context queries ─────────────────────────────
+
+- id: followup_storage_521ge
+  query: "What about its storage options?"
+  category: followup
+  conversation: "User: What is SYS-521GE-TNRT?\nAssistant: The SYS-521GE-TNRT is a 5U GPU SuperServer with dual Intel Xeon processors."
+  must_retrieve:
+    - "521ge"
+  min_sources: 1
+  facts:
+    - "storage"
+    - "521GE"
+  rubric: "Must describe storage options for the SYS-521GE-TNRT from conversation context"
+
+- id: followup_new_topic_ipmi
+  query: "How does IPMI work?"
+  category: followup
+  conversation: "User: What is SYS-521GE-TNRT?\nAssistant: The SYS-521GE-TNRT is a 5U GPU SuperServer with dual Intel Xeon processors."
+  must_retrieve:
+    - "IPMI"
+  must_not_retrieve: []
+  min_sources: 1
+  scope: both
+  facts:
+    - "IPMI"
+    - "management"
+  rubric: "Must explain IPMI in general terms; must NOT reference 521GE since this is a new topic"

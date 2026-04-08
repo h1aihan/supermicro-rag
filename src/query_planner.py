@@ -24,6 +24,19 @@ from dotenv import load_dotenv
 _repo_root_env = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path=_repo_root_env, override=False)
 
+try:
+    from src.form_factors import (
+        FORM_FACTORS_PROMPT_LINE,
+        detect_form_factor_in_user_query,
+        normalize_planner_form_factor,
+    )
+except ImportError:
+    from form_factors import (
+        FORM_FACTORS_PROMPT_LINE,
+        detect_form_factor_in_user_query,
+        normalize_planner_form_factor,
+    )
+
 
 # =============================================================================
 # Query Plan data structure
@@ -40,7 +53,7 @@ class QueryPlan:
     product_codes: List[str] = field(default_factory=list)  # ["SYS-521GE-TNRT", "SYS-421GE-TNRT"]
 
     # Structured filters for the product catalog
-    form_factor: Optional[str] = None        # "1U", "2U", "4U", "8U", "Mid-Tower"
+    form_factor: Optional[str] = None        # rack "1U".."15U" or Mid/Mini/Full-Tower
     tags: List[str] = field(default_factory=list)  # ["Gold Series", "GPU", ...]
     keywords: List[str] = field(default_factory=list)  # free-text terms
 
@@ -98,7 +111,7 @@ PLANNER_SYSTEM = """You are a query router for a Supermicro server product datab
 
 ## PRODUCT TAXONOMY (use these exact strings)
 
-Form factors: "1U", "2U", "4U", "8U", "Mid-Tower"
+Form factors: """ + FORM_FACTORS_PROMPT_LINE + """
 
 Tags (product categories/series):
 - "Gold Series"    — Pre-configured, quick-ship Gold Series SKUs (suffix -G1, -G2)
@@ -158,7 +171,7 @@ IMPORTANT: When user asks for EPYC 9005 systems, include BOTH H14 and H13 in sea
 {
   "intent": "list|detail|compare|general|follow_up|faq",
   "product_codes": [],
-  "form_factor": null or "1U"|"2U"|"4U"|"8U"|"Mid-Tower",
+  "form_factor": null or rack "1U" through "15U" or "Mid-Tower"|"Mini-Tower"|"Full-Tower",
   "tags": [],
   "keywords": [],
   "search_queries": ["query1", "query2"],
@@ -409,7 +422,6 @@ def _call_planner_llm(query: str, conversation_context: Optional[str] = None) ->
 # =============================================================================
 
 VALID_INTENTS = {"list", "detail", "compare", "general", "follow_up", "faq"}
-VALID_FORM_FACTORS = {"1U", "2U", "4U", "8U", "Mid-Tower"}
 VALID_TAGS = {
     "Gold Series", "CloudDC", "Hyper", "Edge", "Storage", "GPU",
     "GPU-capable", "Blade", "Workstation", "Mainstream", "WIO",
@@ -462,8 +474,8 @@ def _parse_plan(raw: str, original_query: str) -> QueryPlan:
         plan.product_codes = [str(c).strip() for c in raw_codes if c and str(c).strip()]
     
     # Form factor
-    ff = data.get("form_factor")
-    if ff and ff in VALID_FORM_FACTORS:
+    ff = normalize_planner_form_factor(data.get("form_factor"))
+    if ff:
         plan.form_factor = ff
     
     # Tags — validate against known set
@@ -593,12 +605,11 @@ def _fallback_plan(query: str) -> QueryPlan:
             plan.tags.append(tag)
             plan.use_catalog = True
     
-    # Extract form factor
-    for ff in ["1U", "2U", "4U", "8U"]:
-        if ff.lower() in q or ff in query:
-            plan.form_factor = ff
-            plan.use_catalog = True
-            break
+    # Extract form factor (leftmost rack U or tower phrase)
+    ff = detect_form_factor_in_user_query(query)
+    if ff:
+        plan.form_factor = ff
+        plan.use_catalog = True
 
     print(f"[QueryPlanner] Fallback plan: {plan}")
     return plan
